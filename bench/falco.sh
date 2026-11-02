@@ -32,6 +32,8 @@ WORKLOADS=(
   "udp-16 udp 16"
   "open-1 open 1 /usr/lib/os-release"
   "open-shadow-1 open 1 /etc/shadow"
+  "unix-1 unix 1"
+  "signal-1 signal 1"
 )
 
 ACTIONS=(

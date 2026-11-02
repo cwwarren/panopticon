@@ -122,6 +122,16 @@ fn worker(workload: &str, rest: &[&str], index: usize, stop: &AtomicBool) -> u64
                 ops += 1;
             }
         }
+        "signal" => {
+            let pid = unsafe { libc::getpid() };
+            let tid = unsafe { libc::gettid() };
+            while !stop.load(Relaxed) {
+                for _ in 0..1000 {
+                    check(unsafe { libc::syscall(libc::SYS_tgkill, pid, tid, libc::SIGURG) });
+                }
+                ops += 1000;
+            }
+        }
         _ => panic!("unknown workload {workload}"),
     }
     ops
