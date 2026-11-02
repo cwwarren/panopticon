@@ -319,6 +319,7 @@ struct file_seen {
 };
 
 #define FILE_DEAD ((__u64)-1)
+#define FILE_GONE ((__u64)-2)
 #define EEXIST 17
 
 struct {
@@ -1101,10 +1102,10 @@ int BPF_PROG(on_inotify_event, struct fsnotify_mark *mark, __u32 mask, struct in
 	seen = bpf_map_lookup_elem(&file_seen, &k);
 	if (seen) {
 		j = *(volatile __u64 *)&seen->jiffies;
-		if (j != FILE_DEAD && (__s64)(now - j) < (__s64)file_window) {
+		if (j < FILE_GONE && (__s64)(now - j) < (__s64)file_window) {
 			n = __sync_fetch_and_add(&seen->repeats, 1);
 			barrier_var(n);
-			if (*(volatile __u64 *)&seen->jiffies == FILE_DEAD &&
+			if (*(volatile __u64 *)&seen->jiffies >= FILE_GONE &&
 			    (n = __sync_lock_test_and_set(&seen->repeats, 0))) {
 				rr = reserve(&ring_file, CLASS_FILE, FILE_RING, sizeof(*rr), &s);
 				if (rr) {
@@ -1116,7 +1117,7 @@ int BPF_PROG(on_inotify_event, struct fsnotify_mark *mark, __u32 mask, struct in
 			bpf_preempt_enable();
 			return 0;
 		}
-		if (j != FILE_DEAD)
+		if (j != FILE_GONE)
 			__sync_val_compare_and_swap(&seen->jiffies, j, now);
 	} else {
 		fresh.jiffies = now;
@@ -1153,14 +1154,16 @@ int file_flush(struct bpf_iter__bpf_map_elem *ctx)
 	struct file_seen *v = ctx->value;
 	struct file_repeat_rec r = {};
 	__u64 now = bpf_jiffies64(), j;
-	bool claimed;
+	bool gone;
 
 	if (!k || !v)
 		return 0;
 	r.k = *k;
 	j = *(volatile __u64 *)&v->jiffies;
-	claimed = j != FILE_DEAD && (__s64)(now - j) >= (__s64)file_window &&
-		  __sync_val_compare_and_swap(&v->jiffies, j, FILE_DEAD) == j;
+	gone = j == FILE_GONE ||
+	       (j == FILE_DEAD && __sync_val_compare_and_swap(&v->jiffies, FILE_DEAD, FILE_GONE) == FILE_DEAD);
+	if (!gone && j < FILE_GONE && (__s64)(now - j) >= (__s64)file_window)
+		__sync_val_compare_and_swap(&v->jiffies, j, FILE_DEAD);
 	r.count = __sync_lock_test_and_set(&v->repeats, 0);
 	if (r.count) {
 		r.h.len = sizeof(r);
@@ -1168,7 +1171,7 @@ int file_flush(struct bpf_iter__bpf_map_elem *ctx)
 		r.h.jiffies = now;
 		bpf_seq_write(ctx->meta->seq, &r, sizeof(r));
 	}
-	if (claimed)
+	if (gone)
 		bpf_map_delete_elem(&file_seen, &r.k);
 	return 0;
 }
