@@ -1,0 +1,74 @@
+- macro: pano_cred_read
+  condition: >
+    (evt.is_open_read = true
+     and (fd.name in (/etc/shadow, /etc/gshadow, /etc/sudoers, /etc/security/opasswd)
+          or fd.directory = /etc/sudoers.d or fd.name contains /.ssh/ or fd.name startswith /root/))
+
+- macro: pano_protected_write
+  condition: >
+    (evt.is_open_write = true
+     and (fd.name startswith /etc/ or fd.name startswith /boot/ or fd.name startswith /root/
+          or fd.name startswith /usr/ or fd.name startswith /var/spool/cron/
+          or fd.name startswith /proc/sys/ or fd.name contains /.ssh/))
+
+- macro: pano_protected_path
+  condition: >
+    (fs.path.name startswith /etc/ or fs.path.source startswith /etc/ or fs.path.target startswith /etc/
+     or fs.path.name startswith /boot/ or fs.path.target startswith /boot/
+     or fs.path.name startswith /root/ or fs.path.target startswith /root/
+     or fs.path.name startswith /usr/ or fs.path.target startswith /usr/
+     or fd.name startswith /etc/ or fd.name startswith /usr/)
+
+- rule: tel_exec
+  desc: Every successful process execution.
+  condition: evt.type in (execve, execveat) and evt.rawres = 0
+  output: >-
+    exec pid=%proc.pid start=%proc.pid.ts ppid=%proc.ppid pstart=%proc.ppid.ts exe=%proc.exepath
+    cmdline=%proc.cmdline pname=%proc.pname pexe=%proc.pexepath uid=%user.uid loginuid=%user.loginuid
+    tty=%proc.tty cid=%container.id
+  priority: INFORMATIONAL
+
+- rule: tel_net
+  desc: Socket attribution - inet connect/accept and first UDP send per destination.
+  condition: >
+    fd.typechar in (4, 6)
+    and ((evt.type in (connect, accept, accept4) and (evt.rawres >= 0 or evt.res = EINPROGRESS))
+         or (evt.type in (sendto, sendmsg) and fd.l4proto = udp and fd.name_changed = true))
+  output: net %evt.type %fd.l4proto %fd.name pid=%proc.pid start=%proc.pid.ts exe=%proc.exepath cid=%container.id
+  priority: INFORMATIONAL
+
+- rule: tel_listen
+  desc: Inet listeners.
+  condition: evt.type = listen and evt.rawres = 0 and fd.typechar in (4, 6)
+  output: listen %fd.name pid=%proc.pid start=%proc.pid.ts exe=%proc.exepath cid=%container.id
+  priority: INFORMATIONAL
+
+- rule: tel_file_open
+  desc: Credential reads and writes under protected paths.
+  condition: >
+    evt.type in (open, openat, openat2, creat) and fd.typechar = f and fd.num >= 0
+    and (pano_cred_read or pano_protected_write)
+  output: file %evt.type %fd.name flags=%evt.arg.flags pid=%proc.pid start=%proc.pid.ts exe=%proc.exepath cid=%container.id
+  priority: INFORMATIONAL
+
+- rule: tel_file_mod
+  desc: Metadata and namespace changes under protected paths.
+  condition: >
+    evt.type in (rename, renameat, renameat2, unlink, unlinkat, link, linkat, symlink, symlinkat,
+                 chmod, fchmod, fchmodat, chown, fchown, lchown, fchownat, mkdir, mkdirat, rmdir)
+    and pano_protected_path
+  output: >-
+    filemod %evt.type path=%fs.path.name src=%fs.path.source dst=%fs.path.target fd=%fd.name res=%evt.res
+    pid=%proc.pid start=%proc.pid.ts exe=%proc.exepath cid=%container.id
+  priority: INFORMATIONAL
+
+- rule: tel_kernel
+  desc: Privileged kernel and administrative operations.
+  condition: >
+    proc.name != falco
+    and evt.type in (init_module, finit_module, delete_module, bpf, mount, umount, umount2, chroot,
+                     unshare, setns, ptrace, process_vm_writev, process_vm_readv, pidfd_getfd, memfd_create,
+                     kexec_load, kexec_file_load, settimeofday, clock_settime, capset, setuid, setresuid,
+                     setgid, setresgid, setreuid, setregid, pivot_root, move_mount, fsmount)
+  output: kernel %evt.type res=%evt.res args=[%evt.args] pid=%proc.pid start=%proc.pid.ts exe=%proc.exepath cid=%container.id
+  priority: INFORMATIONAL

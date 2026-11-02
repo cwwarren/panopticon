@@ -1,0 +1,12 @@
+- rule: pano_coverage
+  desc: Every event Falco can deliver for the loadgen coverage actions and the container probe.
+  condition: >
+    proc.name != falco
+    and (proc.name = loadgen or proc.pname in (loadgen, sudo)
+         or proc.cmdline contains pano- or proc.pcmdline contains pano-)
+  output: >-
+    %evt.type res=%evt.res fd=%fd.name path=%fs.path.name src=%fs.path.source dst=%fs.path.target
+    args=[%evt.args] proc=%proc.name exe=%proc.exepath cmd=%proc.cmdline pid=%proc.pid ppid=%proc.ppid
+    pname=%proc.pname pcmd=%proc.pcmdline uid=%user.uid loginuid=%user.loginuid memfd=%proc.is_exe_from_memfd
+    cid=%container.id image=%container.image.repository k8s=%k8s.ns.name/%k8s.pod.name cgroups=%thread.cgroups
+  priority: DEBUG

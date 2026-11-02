@@ -1,0 +1,12 @@
+{"workload":"kbuild","secs":50.259,"cond":"none","rep":1,"name":"kbuild","t0":1793588836.074213386,"t1":1793588886.333186440,"agent_cpu_s":0.00,"agent_rss_kb":0}
+{"workload":"kbuild","secs":50.378,"cond":"noop-precise","rep":1,"name":"kbuild","t0":1793588888.094999166,"t1":1793588938.473041502,"agent_cpu_s":0.01,"agent_rss_kb":196500}
+{"workload":"kbuild","secs":51.4043,"cond":"falco-default","rep":1,"name":"kbuild","t0":1793588945.153934180,"t1":1793588996.558227582,"agent_cpu_s":24.74,"agent_rss_kb":354732}
+{"workload":"kbuild","secs":50.3617,"cond":"pano","rep":1,"name":"kbuild","t0":1793588998.877375585,"t1":1793589049.239078871,"agent_cpu_s":0.12,"agent_rss_kb":22916}
+{"workload":"kbuild","secs":50.3042,"cond":"none","rep":2,"name":"kbuild","t0":1793589050.691210855,"t1":1793589100.995419176,"agent_cpu_s":0.00,"agent_rss_kb":0}
+{"workload":"kbuild","secs":50.3203,"cond":"noop-precise","rep":2,"name":"kbuild","t0":1793589102.745553456,"t1":1793589153.065877759,"agent_cpu_s":0.02,"agent_rss_kb":196404}
+{"workload":"kbuild","secs":51.5847,"cond":"falco-default","rep":2,"name":"kbuild","t0":1793589159.750244441,"t1":1793589211.334967809,"agent_cpu_s":24.79,"agent_rss_kb":355080}
+{"workload":"kbuild","secs":50.3479,"cond":"pano","rep":2,"name":"kbuild","t0":1793589213.682247418,"t1":1793589264.030125932,"agent_cpu_s":0.12,"agent_rss_kb":22948}
+{"workload":"kbuild","secs":50.577,"cond":"none","rep":3,"name":"kbuild","t0":1793589265.490766264,"t1":1793589316.067777836,"agent_cpu_s":0.00,"agent_rss_kb":0}
+{"workload":"kbuild","secs":50.4647,"cond":"noop-precise","rep":3,"name":"kbuild","t0":1793589317.816871216,"t1":1793589368.281588222,"agent_cpu_s":0.02,"agent_rss_kb":196544}
+{"workload":"kbuild","secs":51.5509,"cond":"falco-default","rep":3,"name":"kbuild","t0":1793589374.951113938,"t1":1793589426.502029575,"agent_cpu_s":24.78,"agent_rss_kb":356348}
+{"workload":"kbuild","secs":50.3719,"cond":"pano","rep":3,"name":"kbuild","t0":1793589428.843758528,"t1":1793589479.215704999,"agent_cpu_s":0.11,"agent_rss_kb":22976}

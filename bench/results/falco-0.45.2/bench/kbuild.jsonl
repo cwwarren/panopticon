@@ -1,0 +1,15 @@
+{"workload":"kbuild","secs":51.1669,"cond":"none","rep":1,"name":"kbuild","t0":1793473757.905143016,"t1":1793473809.071996166,"agent_cpu_s":0.00,"agent_rss_kb":0}
+{"workload":"kbuild","secs":51.2108,"cond":"noop-syscall-tp","rep":1,"name":"kbuild","t0":1793473810.714609671,"t1":1793473861.925439826,"agent_cpu_s":0.01,"agent_rss_kb":185812}
+{"workload":"kbuild","secs":50.2993,"cond":"noop-precise","rep":1,"name":"kbuild","t0":1793473863.793446322,"t1":1793473914.092762368,"agent_cpu_s":0.01,"agent_rss_kb":196792}
+{"workload":"kbuild","secs":51.4826,"cond":"falco-default","rep":1,"name":"kbuild","t0":1793473920.772885797,"t1":1793473972.255499479,"agent_cpu_s":24.67,"agent_rss_kb":364136}
+{"workload":"kbuild","secs":51.1994,"cond":"falco-telemetry","rep":1,"name":"kbuild","t0":1793473979.347858677,"t1":1793474030.547296610,"agent_cpu_s":16.55,"agent_rss_kb":363512}
+{"workload":"kbuild","secs":50.1886,"cond":"none","rep":2,"name":"kbuild","t0":1793474032.586285006,"t1":1793474082.774868378,"agent_cpu_s":0.00,"agent_rss_kb":0}
+{"workload":"kbuild","secs":50.4832,"cond":"noop-syscall-tp","rep":2,"name":"kbuild","t0":1793474084.407469418,"t1":1793474134.890676345,"agent_cpu_s":0.01,"agent_rss_kb":185844}
+{"workload":"kbuild","secs":50.1979,"cond":"noop-precise","rep":2,"name":"kbuild","t0":1793474136.752993533,"t1":1793474186.950907494,"agent_cpu_s":0.02,"agent_rss_kb":196924}
+{"workload":"kbuild","secs":51.3305,"cond":"falco-default","rep":2,"name":"kbuild","t0":1793474193.626494645,"t1":1793474244.956957059,"agent_cpu_s":24.51,"agent_rss_kb":363832}
+{"workload":"kbuild","secs":51.1513,"cond":"falco-telemetry","rep":2,"name":"kbuild","t0":1793474252.101560902,"t1":1793474303.252904551,"agent_cpu_s":16.54,"agent_rss_kb":361944}
+{"workload":"kbuild","secs":50.3287,"cond":"none","rep":3,"name":"kbuild","t0":1793474305.283481974,"t1":1793474355.612205322,"agent_cpu_s":0.00,"agent_rss_kb":0}
+{"workload":"kbuild","secs":50.4214,"cond":"noop-syscall-tp","rep":3,"name":"kbuild","t0":1793474357.247216630,"t1":1793474407.668664912,"agent_cpu_s":0.02,"agent_rss_kb":185936}
+{"workload":"kbuild","secs":51.2139,"cond":"noop-precise","rep":3,"name":"kbuild","t0":1793474409.533179736,"t1":1793474460.747111169,"agent_cpu_s":0.01,"agent_rss_kb":196788}
+{"workload":"kbuild","secs":52.1384,"cond":"falco-default","rep":3,"name":"kbuild","t0":1793474467.418003810,"t1":1793474519.556436645,"agent_cpu_s":24.78,"agent_rss_kb":363856}
+{"workload":"kbuild","secs":52.0663,"cond":"falco-telemetry","rep":3,"name":"kbuild","t0":1793474526.722815329,"t1":1793474578.789103825,"agent_cpu_s":16.69,"agent_rss_kb":364320}

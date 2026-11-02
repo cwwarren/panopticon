@@ -1,0 +1,10 @@
+natfilter 1 rep 1: @calls: 870642 
+natfilter 16 rep 1: @calls: 9189222 
+natfilter 1 rep 2: @calls: 859436 @translated: 2 
+natfilter 16 rep 2: @calls: 9335050 
+natfilter 1 rep 3: @calls: 855824 
+natfilter 16 rep 3: @calls: 9468734 
+natfilter 1 rep 4: @calls: 855126 
+natfilter 16 rep 4: @calls: 9414502 
+natfilter 1 rep 5: @calls: 873770 
+natfilter 16 rep 5: @calls: 9229890 

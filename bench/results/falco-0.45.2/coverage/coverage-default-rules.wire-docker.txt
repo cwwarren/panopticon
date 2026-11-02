@@ -1,0 +1,1 @@
+18:28:26.847823 IP 192.168.1.18.52008 > 1.1.1.1.80: Flags [S], seq 4217051270, win 64240, options [mss 1460,sackOK,TS val 657161383 ecr 0,nop,wscale 10], length 0
