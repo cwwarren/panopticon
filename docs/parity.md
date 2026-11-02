@@ -185,12 +185,12 @@ of Sigma, Elastic and Falco Linux rules that need the capability.
 ## What parity cost
 
 Most hooks added for parity fire only on the operation they record. Four also run for activity that
-is usually unrelated; run 3 measured each:
+is usually unrelated, and the exit hook runs for every process; run 3 measured each:
 
 | Hook | Fires on | Measured |
 |---|---|---|
 | `lsm/unix_stream_connect` | every unix stream connect | 19 ns of BPF; +9 ns end to end on a connect loop |
-| `lsm/task_kill` | every signal a process sends | 7 ns of BPF; +7 ns end to end on a `tgkill` loop (103 → 110 ns) |
+| `lsm/task_kill` | every signal a process sends | 7 ns of BPF; +7 ns end to end on a `tgkill` loop (101.5 → 108.6 ns) |
 | `ptrace_access_check` | every ptrace-mode check, including `/proc/<pid>/stat` reads | 14–18 ns of BPF per check |
 | `__nf_conntrack_confirm` | every new connection on a host with conntrack | 8–9 ns of BPF; emits only for NAT |
 | `tp_btf/sched_process_exit` | every process exit (last thread) | 114 ns of BPF per exit |
