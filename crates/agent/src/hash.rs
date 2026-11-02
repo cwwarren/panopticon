@@ -1,11 +1,12 @@
 use std::collections::HashSet;
 use std::fs::{File, OpenOptions};
-use std::io;
+use std::io::{self, Read};
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::Path;
 use std::sync::mpsc::{self, Receiver, Sender, SyncSender, TrySendError};
 use std::thread;
+use std::time::Instant;
 
 use sha2::{Digest, Sha256};
 
@@ -14,6 +15,10 @@ use crate::wire;
 const QUEUE: usize = 1024;
 // Distinct executables remembered before the set is cleared; a cleared key costs one idle re-hash.
 const SEEN_MAX: usize = 1 << 16;
+const CHUNK: usize = 256 << 10;
+// The startup backlog sleeps 3x each chunk's hashing time: a quarter of one core at most, so it
+// competes less with co-running work through caches and SMT siblings; it finishes about 4x later.
+const BACKLOG_PAUSE: u32 = 3;
 const IOPRIO_CLASS_IDLE: libc::c_int = 3;
 const IOPRIO_CLASS_SHIFT: libc::c_int = 13;
 const IOPRIO_WHO_PROCESS: libc::c_int = 1;
@@ -46,7 +51,7 @@ impl Hasher {
         let (jobs, queue) = mpsc::sync_channel::<Job>(QUEUE);
         let (results, done) = mpsc::channel();
         let sender = results.clone();
-        thread::spawn(move || work(queue, &sender));
+        thread::spawn(move || work(queue, &sender, 0));
         Hasher {
             seen: HashSet::new(),
             backlog: Some(Vec::new()),
@@ -84,7 +89,7 @@ impl Hasher {
     pub fn release_backlog(&mut self) {
         let jobs = self.backlog.take().unwrap();
         let results = self.results.clone();
-        thread::spawn(move || work(jobs, &results));
+        thread::spawn(move || work(jobs, &results, BACKLOG_PAUSE));
     }
 
     pub fn request_file(&mut self, dev: u32, ino: u64, path: &Path, jiffies: u64) {
@@ -115,10 +120,11 @@ impl Hasher {
     }
 }
 
-fn work(jobs: impl IntoIterator<Item = Job>, results: &Sender<Vec<u8>>) {
+fn work(jobs: impl IntoIterator<Item = Job>, results: &Sender<Vec<u8>>, pause: u32) {
     idle();
+    let mut chunk = vec![0u8; CHUNK];
     for job in jobs {
-        if let Some(rec) = hash(&job)
+        if let Some(rec) = hash(&job, &mut chunk, pause)
             && results.send(rec).is_err()
         {
             return;
@@ -182,12 +188,23 @@ fn open(job: &Job) -> Option<(File, Key, u64)> {
     None
 }
 
-fn hash(job: &Job) -> Option<Vec<u8>> {
+fn hash(job: &Job, chunk: &mut [u8], pause: u32) -> Option<Vec<u8>> {
     let (mut file, key, size) = open(job)?;
     let fd = file.as_raw_fd();
     unsafe { libc::posix_fadvise(fd, 0, 0, libc::POSIX_FADV_NOREUSE) };
     let mut digest = Sha256::new();
-    let read = io::copy(&mut file, &mut digest);
+    let read = loop {
+        let start = Instant::now();
+        match file.read(chunk) {
+            Ok(0) => break Ok(()),
+            Ok(n) => digest.update(&chunk[..n]),
+            Err(err) if err.kind() == io::ErrorKind::Interrupted => {}
+            Err(err) => break Err(err),
+        }
+        if pause > 0 {
+            thread::sleep(start.elapsed() * pause);
+        }
+    };
     unsafe { libc::posix_fadvise(fd, 0, 0, libc::POSIX_FADV_DONTNEED) };
     read.ok()?;
     let digest = digest.finalize();
