@@ -261,15 +261,23 @@ Safety comes from the same structure that makes it fast:
 
 - One ring per CPU means one producer per ring unless the producer is interrupted.
 - Preemption is disabled for the few nanoseconds of the write.
-- The busy flag turns any nested producer on the same CPU (a softirq interrupting a task-context
-  producer of the nat class, an NMI, a future hook in an unexpected context) into a counted drop instead
-  of a corrupted ring, so no class depends on its hooks running in one kind of context. Uncontended it
+- The busy flag turns a nested producer of the same ring on the same CPU into a counted drop instead
+  of a corrupted ring: a different program in an interrupting context, an NMI, a future hook in an
+  unexpected context. No class depends on its hooks running in one kind of context. Uncontended it
   costs nothing measurable: 52.10 ns against 52.29 ns per `getppid` with an emitting program (41.23 ns
   without one), medians of 11 interleaved pinned runs of `crates/ringbench` variants `spsc_busy` and
   `spsc_nots`.
+- A nested invocation of the same fentry, fexit or tp_btf program never reaches the flag: the
+  kernel's per-program, per-CPU recursion guard skips it and counts it in the program's
+  `recursion_misses` (LSM programs have no guard). That covers a softirq `on_nat` under a task-context
+  `on_nat`, and also a task preempted inside a tracing program, which makes the same program skip in
+  every other task on that CPU until it resumes. The agent reads every program's counter once per
+  second and writes a `miss` record with the program name and the new count, so this loss is reported
+  like ring drops. None appeared with 32 UDP or connect threads on 2 CPUs.
 - Drop counters are incremented atomically, because a nested producer can race the holder.
 - Every writer stays within the `max_record` bytes it reserved. The verifier only checks that writes
-  stay inside the map value, so this is a code invariant, not a verifier guarantee.
+  stay inside the map value, so this is a code invariant, not a verifier guarantee; the formal model
+  shows that one byte past `max` overwrites the oldest unread record.
 
 Kernel requirements: `bpf_preempt_disable` (6.10), BPF load-acquire/store-release (6.15), BPF LSM,
 task and socket local storage.
@@ -291,7 +299,10 @@ One thread:
   their kernel memory near zero and does not change the producer's cost (+87.4 ns per marked open
   drained, +89.2 ns never read).
 - Once per second and at shutdown: clock record, a loss record for any ring whose drop counter
-  moved, and the repeat records from the file coalescing iterator.
+  moved, a miss record for any program whose recursion counter moved, and the repeat records from the
+  file coalescing iterator.
+- At shutdown the agent first detaches every program, waits one poll interval for invocations in
+  flight, and only then drains the rings and reads the iterator, so nothing committed is left behind.
 - Collect finished hashes from the hashing worker.
 - Write the buffer to the sink.
 
@@ -330,7 +341,9 @@ namespace, process key, image key, cgroup, time.
 - UDP over IPv4 and IPv6: `fexit/udp_sendmsg` and `fexit/udpv6_sendmsg` share one path. Each
   destination (16-byte address and port) is checked against the socket's last 4 in socket-local
   storage, and a new one emits a record. After 16 records the socket is flagged saturated and reports
-  nothing more; its own tuple joins the rest of its flows. A send to an IPv4-mapped address is recorded
+  nothing more (DNS queries are always recorded and do not move the count past 16). The table is
+  updated without a lock, so two threads sending on one socket can exceed 16 by a few records. Its own
+  tuple joins the rest of its flows. A send to an IPv4-mapped address is recorded
   once, by the IPv4 hook. `connect()` on UDP without traffic is not recorded because no flow follows it.
 - DNS over IPv4 and IPv6: every query payload when the destination port is 53; the socket is tagged,
   and answers are copied from `skb_consume_udp` for tagged sockets only. Covers glibc and musl stub
@@ -436,7 +449,10 @@ skip that allocation: `inotify_handle_inode_event` is not error-injectable, so `
 attach, and fanotify has no BPF hooks. Unlisted files pay nothing.
 
 Limit: with more than 4096 keys active within one second, LRU eviction drops the pending counts of
-evicted keys without a loss record. Every access after an eviction still emits a full record.
+evicted keys without a loss record, and because an evicted element is reused at once while another
+CPU may still hold a pointer to it, a count can land on a different key. Every access after an
+eviction still emits a full record. The window test is a signed difference, so an invocation that
+read the clock just before another CPU advanced the key's window counts as inside it.
 
 ### Admin operations
 

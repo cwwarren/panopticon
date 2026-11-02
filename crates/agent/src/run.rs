@@ -17,10 +17,10 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use libbpf_rs::skel::{OpenSkel, Skel, SkelBuilder};
 use libbpf_rs::{Iter, Link, MapCore, MapFlags, MapHandle, OpenObject, ProgramInput};
 
-use crate::bpf::{AgentSkel, AgentSkelBuilder, types};
+use crate::bpf::{AgentLinks, AgentSkel, AgentSkelBuilder, types};
 use crate::container;
 use crate::hash::{self, Hasher};
-use crate::nat_bpf::{NatSkel, NatSkelBuilder};
+use crate::nat_bpf::{NatLinks, NatSkel, NatSkelBuilder};
 use crate::wire;
 
 static STOP: AtomicBool = AtomicBool::new(false);
@@ -231,8 +231,16 @@ pub fn run(out_path: &str, poll: Duration) {
 
     let mut last_clock = Instant::now();
     let mut coalesced = 0;
+    let mut misses = HashMap::new();
     loop {
         let stop = STOP.load(Ordering::Relaxed);
+        if stop {
+            skel.links = AgentLinks::default();
+            if let Some(nat) = &mut nat {
+                nat.links = NatLinks::default();
+            }
+            thread::sleep(poll);
+        }
         for ring in &mut rings {
             ring.drain(&mut buf, &mut hashes, &watcher);
         }
@@ -240,9 +248,10 @@ pub fn run(out_path: &str, poll: Duration) {
         hashes.collect(&mut buf);
         if stop || last_clock.elapsed() >= Duration::from_secs(1) {
             jiffies = push_clock(&skel, &mut buf);
-            if nat.is_none() {
+            if !stop && nat.is_none() {
                 nat = attach_nat(&skel, ncpus, nat_storage);
             }
+            push_misses(&skel, nat.as_ref(), &mut misses, &mut buf, jiffies);
             for ring in &mut rings {
                 push_loss(ring, &mut buf, jiffies);
             }
@@ -652,20 +661,51 @@ fn register_object(skel: &AgentSkel, object: &libbpf_rs::Object) {
             .unwrap();
     }
     for prog in object.progs().filter(|p| p.autoload()) {
-        let mut info = libbpf_rs::libbpf_sys::bpf_prog_info::default();
-        let mut len = u32::try_from(size_of_val(&info)).unwrap();
-        let ret = unsafe {
-            libbpf_rs::libbpf_sys::bpf_prog_get_info_by_fd(
-                prog.as_fd().as_raw_fd(),
-                &mut info,
-                &mut len,
-            )
-        };
-        assert_eq!(ret, 0, "bpf_prog_get_info_by_fd");
         skel.maps
             .our_progs
-            .update(&info.id.to_ne_bytes(), &[1], MapFlags::ANY)
+            .update(&prog_info(&prog).id.to_ne_bytes(), &[1], MapFlags::ANY)
             .unwrap();
+    }
+}
+
+fn prog_info(prog: &libbpf_rs::Program) -> libbpf_rs::libbpf_sys::bpf_prog_info {
+    let mut info = libbpf_rs::libbpf_sys::bpf_prog_info::default();
+    let mut len = u32::try_from(size_of_val(&info)).unwrap();
+    let ret = unsafe {
+        libbpf_rs::libbpf_sys::bpf_prog_get_info_by_fd(
+            prog.as_fd().as_raw_fd(),
+            &mut info,
+            &mut len,
+        )
+    };
+    assert_eq!(ret, 0, "bpf_prog_get_info_by_fd");
+    info
+}
+
+fn push_misses(
+    skel: &AgentSkel,
+    nat: Option<&NatSkel>,
+    reported: &mut HashMap<u32, u64>,
+    buf: &mut Vec<u8>,
+    jiffies: u64,
+) {
+    for object in std::iter::once(skel.object()).chain(nat.map(|n| n.object())) {
+        for prog in object.progs().filter(|p| p.autoload()) {
+            let info = prog_info(&prog);
+            let last = reported.entry(info.id).or_insert(0);
+            if info.recursion_misses > *last {
+                wire::push(
+                    buf,
+                    wire::REC_MISS,
+                    jiffies,
+                    &[
+                        &(info.recursion_misses - *last).to_ne_bytes(),
+                        prog.name().as_bytes(),
+                    ],
+                );
+                *last = info.recursion_misses;
+            }
+        }
     }
 }
 

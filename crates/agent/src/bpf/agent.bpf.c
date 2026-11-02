@@ -822,8 +822,7 @@ static __always_inline void udp_emit(struct sock *sk, struct msghdr *msg, int re
 		m->seen[slot].addr[1] = addr[1];
 		m->seen[slot].port = port;
 		m->next = slot + 1;
-		m->distinct += 1;
-		if (m->distinct == UDP_CAP)
+		if (m->distinct < UDP_CAP && ++m->distinct == UDP_CAP)
 			flags |= FLAG_SATURATED;
 	}
 	if (dns)
@@ -1083,7 +1082,7 @@ int BPF_PROG(on_inotify_event, struct fsnotify_mark *mark, __u32 mask, struct in
 	k.dev = obj->i_sb->s_dev;
 	k.mask = mask;
 	seen = bpf_map_lookup_elem(&file_seen, &k);
-	if (seen && now - seen->jiffies < file_window) {
+	if (seen && (__s64)(now - seen->jiffies) < (__s64)file_window) {
 		__sync_fetch_and_add(&seen->repeats, 1);
 		return 0;
 	}

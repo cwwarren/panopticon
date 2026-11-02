@@ -32,6 +32,7 @@ const LOSS: u32 = wire::REC_LOSS as u32;
 const WATCH: u32 = wire::REC_WATCH as u32;
 const CONTAINER: u32 = wire::REC_CONTAINER as u32;
 const HASH: u32 = wire::REC_HASH as u32;
+const MISS: u32 = wire::REC_MISS as u32;
 
 const MASKS: [(u32, &str); 15] = [
     (0x1, "access"),
@@ -431,6 +432,14 @@ impl Decoder {
                     .num("class", class)
                     .num("cpu", cpu)
                     .num("drops", drops)
+            }
+            MISS => {
+                let count: u64 = read(&rec[wire::HDR..]);
+                let name = &rec[wire::HDR + 8..];
+                let name = &name[..name.iter().position(|&b| b == 0).unwrap_or(name.len())];
+                Obj::new("miss", ts)
+                    .str("prog", &text(name))
+                    .num("count", count)
             }
             EXEC => self.exec(rec, h, ts),
             CGROUP => {
