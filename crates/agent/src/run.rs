@@ -136,11 +136,17 @@ impl Ring {
             } else if ty == types::rec_type::REC_FILE.0 as u8 {
                 let r: types::file_rec = wire::read(&out[start..]);
                 let mask = r.k.mask;
+                let name =
+                    out[start + size_of::<types::file_rec>()..][..usize::from(r.name_len)].to_vec();
                 if mask & libc::IN_ISDIR != 0 && mask & (libc::IN_CREATE | libc::IN_MOVED_TO) != 0 {
-                    let name = out[start + size_of::<types::file_rec>()..]
-                        [..usize::from(r.name_len)]
-                        .to_vec();
                     watcher.created(out, r.h.jiffies, (r.k.dev, r.k.ino), &name);
+                } else if mask & libc::IN_ISDIR == 0
+                    && mask & (libc::IN_CLOSE_WRITE | libc::IN_MOVED_TO) != 0
+                    && !name.is_empty()
+                    && let Some(dir) = watcher.path((r.k.dev, r.k.ino))
+                {
+                    let path = dir.join(OsStr::from_bytes(&name));
+                    hashes.request_file(r.k.dev, r.k.child_ino, &path, r.h.jiffies);
                 }
             }
             self.tail += len;
@@ -426,6 +432,7 @@ fn watch_list() -> Vec<(PathBuf, u32, bool)> {
 
 struct Watcher {
     fd: RawFd,
+    paths: RefCell<HashMap<(u32, u64), PathBuf>>,
     grow: RefCell<HashMap<(u32, u64), (PathBuf, u32)>>,
 }
 
@@ -435,8 +442,13 @@ impl Watcher {
         assert!(fd >= 0, "inotify_init1: {}", io::Error::last_os_error());
         Watcher {
             fd,
+            paths: RefCell::new(HashMap::new()),
             grow: RefCell::new(HashMap::new()),
         }
+    }
+
+    fn path(&self, key: (u32, u64)) -> Option<PathBuf> {
+        self.paths.borrow().get(&key).cloned()
     }
 
     fn add(
@@ -468,6 +480,9 @@ impl Watcher {
                 path.as_os_str().as_bytes(),
             ],
         );
+        self.paths
+            .borrow_mut()
+            .insert((dev, meta.ino()), path.to_path_buf());
         Ok((dev, meta.ino()))
     }
 

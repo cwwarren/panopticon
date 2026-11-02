@@ -13,6 +13,7 @@ const CGROUP: u32 = types::rec_type::REC_CGROUP.0;
 const CONNECT: u32 = types::rec_type::REC_CONNECT.0;
 const ACCEPT: u32 = types::rec_type::REC_ACCEPT.0;
 const LISTEN: u32 = types::rec_type::REC_LISTEN.0;
+const BIND: u32 = types::rec_type::REC_BIND.0;
 const UDP_SEND: u32 = types::rec_type::REC_UDP_SEND.0;
 const DNS_QUERY: u32 = types::rec_type::REC_DNS_QUERY.0;
 const DNS_ANSWER: u32 = types::rec_type::REC_DNS_ANSWER.0;
@@ -63,6 +64,9 @@ pub fn decode(path: &str) {
         decoder.index(rec, &h);
     }
     decoder.clocks.sort_unstable();
+    for hashes in decoder.inode_hashes.values_mut() {
+        hashes.sort_unstable();
+    }
     let mut out = BufWriter::new(io::stdout().lock());
     for (rec, h) in records(&data) {
         if let Some(line) = decoder.record(rec, &h) {
@@ -100,6 +104,7 @@ struct Decoder {
     containers: HashMap<u64, String>,
     hashes: HashMap<(u32, u64, i64), String>,
     paths: HashMap<(u32, u64), String>,
+    inode_hashes: HashMap<(u32, u64), Vec<(u64, String)>>,
 }
 
 struct Obj(String);
@@ -273,6 +278,10 @@ impl Decoder {
             }
             HASH => {
                 let (key, _, digest) = hash_rec(rec);
+                self.inode_hashes
+                    .entry((key.0, key.1))
+                    .or_default()
+                    .push((h.jiffies, digest.clone()));
                 self.hashes.insert(key, digest);
             }
             CONTAINER => {
@@ -430,14 +439,23 @@ impl Decoder {
                     .num("id", r.id)
                     .str("path", &text(&body[..usize::from(r.path_len)]))
             }
-            CONNECT | ACCEPT | LISTEN | UDP_SEND | DNS_QUERY | DNS_ANSWER => self.sock(rec, h, ts),
+            CONNECT | ACCEPT | LISTEN | BIND | UDP_SEND | DNS_QUERY | DNS_ANSWER => {
+                self.sock(rec, h, ts)
+            }
             FILE => {
                 let r: types::file_rec = read(rec);
                 let name = text(&rec[size_of::<types::file_rec>()..][..usize::from(r.name_len)]);
+                let changed = r.k.mask & (0x8 | 0x80) != 0;
+                let sha256 = self
+                    .inode_hashes
+                    .get(&(r.k.dev, r.k.child_ino))
+                    .and_then(|v| v.iter().find(|(j, _)| changed && *j >= h.jiffies))
+                    .map_or("", |(_, d)| d.as_str());
                 self.file(
                     self.actor(Obj::new("file", ts), &r.a).str("name", &name),
                     &r.k,
                 )
+                .str("sha256", sha256)
             }
             FILE_REPEAT => {
                 let r: types::file_repeat_rec = read(rec);
@@ -731,6 +749,7 @@ impl Decoder {
                 .str("object", if a0 == 0 { "map" } else { "prog" })
                 .num("id", a1)
                 .str("fmode", &format!("{a2:#x}")),
+            op::ADMIN_ANON_INODE => obj.str("op", "anon_inode").str("name", &s0),
             other => panic!("unknown admin op {}", other.0),
         }
     }
@@ -742,6 +761,7 @@ impl Decoder {
             CONNECT => "connect",
             ACCEPT => "accept",
             LISTEN => "listen",
+            BIND => "bind",
             UDP_SEND => "udp_send",
             DNS_QUERY => "dns_query",
             _ => "dns_answer",

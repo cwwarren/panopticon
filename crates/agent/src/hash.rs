@@ -1,8 +1,9 @@
 use std::collections::HashSet;
-use std::fs::File;
+use std::fs::{File, OpenOptions};
 use std::io;
 use std::os::fd::AsRawFd;
-use std::os::unix::fs::MetadataExt;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+use std::path::Path;
 use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
 use std::thread;
 
@@ -24,7 +25,7 @@ pub struct Key {
 
 struct Job {
     key: Key,
-    pid: u32,
+    pid: Option<u32>,
     path: String,
     jiffies: u64,
 }
@@ -64,15 +65,31 @@ impl Hasher {
         }
         let job = Job {
             key,
-            pid,
+            pid: Some(pid),
             path: String::from_utf8_lossy(path).into_owned(),
             jiffies,
         };
+        if !self.send(job) {
+            self.seen.remove(&key);
+        }
+    }
+
+    pub fn request_file(&mut self, dev: u32, ino: u64, path: &Path, jiffies: u64) {
+        let job = Job {
+            key: Key { dev, ino, ctime: 0 },
+            pid: None,
+            path: path.to_string_lossy().into_owned(),
+            jiffies,
+        };
+        self.send(job);
+    }
+
+    fn send(&mut self, job: Job) -> bool {
         match self.jobs.try_send(job) {
-            Ok(()) => {}
+            Ok(()) => true,
             Err(TrySendError::Full(_)) => {
-                self.seen.remove(&key);
                 self.dropped += 1;
+                false
             }
             Err(TrySendError::Disconnected(_)) => panic!("hash worker exited"),
         }
@@ -102,24 +119,39 @@ fn idle() {
     );
 }
 
-fn open(job: &Job) -> Option<(File, u64)> {
-    for path in [format!("/proc/{}/exe", job.pid), job.path.clone()] {
-        let Ok(file) = File::open(&path) else {
+fn open(job: &Job) -> Option<(File, Key, u64)> {
+    let candidates = match job.pid {
+        Some(pid) => vec![format!("/proc/{pid}/exe"), job.path.clone()],
+        None => vec![job.path.clone()],
+    };
+    for path in candidates {
+        let mut options = OpenOptions::new();
+        options.read(true);
+        if job.pid.is_none() {
+            options.custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW);
+        }
+        let Ok(file) = options.open(&path) else {
             continue;
         };
         let meta = file.metadata().unwrap();
-        if wire::kernel_dev(meta.dev()) == job.key.dev
-            && meta.ino() == job.key.ino
-            && meta.ctime() == job.key.ctime
+        let key = Key {
+            dev: wire::kernel_dev(meta.dev()),
+            ino: meta.ino(),
+            ctime: meta.ctime(),
+        };
+        if meta.is_file()
+            && key.dev == job.key.dev
+            && key.ino == job.key.ino
+            && (job.pid.is_none() || key.ctime == job.key.ctime)
         {
-            return Some((file, meta.size()));
+            return Some((file, key, meta.size()));
         }
     }
     None
 }
 
 fn hash(job: &Job) -> Option<Vec<u8>> {
-    let (mut file, size) = open(job)?;
+    let (mut file, key, size) = open(job)?;
     let fd = file.as_raw_fd();
     unsafe { libc::posix_fadvise(fd, 0, 0, libc::POSIX_FADV_NOREUSE) };
     let mut digest = Sha256::new();
@@ -133,10 +165,10 @@ fn hash(job: &Job) -> Option<Vec<u8>> {
         wire::REC_HASH,
         job.jiffies,
         &[
-            &job.key.ino.to_ne_bytes(),
-            &job.key.dev.to_ne_bytes(),
+            &key.ino.to_ne_bytes(),
+            &key.dev.to_ne_bytes(),
             &[0u8; 4],
-            &job.key.ctime.to_ne_bytes(),
+            &key.ctime.to_ne_bytes(),
             &size.to_ne_bytes(),
             &digest,
         ],

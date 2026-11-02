@@ -57,6 +57,7 @@ enum rec_type {
 	REC_UNIX_CONNECT,
 	REC_NAT,
 	REC_PATH,
+	REC_BIND,
 };
 
 enum rec_flag {
@@ -87,6 +88,7 @@ enum admin_op {
 	ADMIN_USERNS,
 	ADMIN_KILL,
 	ADMIN_BPF_ACCESS,
+	ADMIN_ANON_INODE,
 };
 
 enum limits {
@@ -905,6 +907,22 @@ int BPF_PROG(on_accept, struct sock *sk, struct proto_accept_arg *arg, struct so
 	return 0;
 }
 
+SEC("fexit/inet_bind")
+int BPF_PROG(on_bind, struct socket *sock, struct sockaddr *uaddr, int addr_len, int ret)
+{
+	if (!ret && sock->type == SOCK_DGRAM)
+		emit_sock(sock->sk, REC_BIND);
+	return 0;
+}
+
+SEC("fexit/inet6_bind")
+int BPF_PROG(on_bind6, struct socket *sock, struct sockaddr *uaddr, int addr_len, int ret)
+{
+	if (!ret && sock->type == SOCK_DGRAM)
+		emit_sock(sock->sk, REC_BIND);
+	return 0;
+}
+
 SEC("fexit/inet_listen")
 int BPF_PROG(on_listen, struct socket *sock, int backlog, int ret)
 {
@@ -1655,6 +1673,26 @@ int BPF_PROG(on_bpf_prog, struct bpf_prog *prog)
 
 	if ((bpf_get_current_pid_tgid() >> 32) != agent_tgid && bpf_map_lookup_elem(&our_progs, &id))
 		admin_emit(ADMIN_BPF_ACCESS, 1, id, 0, 0);
+	return 0;
+}
+
+SEC("lsm/inode_init_security_anon")
+int BPF_PROG(on_anon_inode, struct inode *inode, const struct qstr *name, const struct inode *context_inode)
+{
+	struct admin_rec *r;
+	struct ring_slot s;
+	__u32 len = 0;
+	long n;
+
+	bpf_preempt_disable();
+	r = admin_begin(&s, ADMIN_ANON_INODE);
+	if (r) {
+		n = bpf_probe_read_kernel_str(r->data, PATH_NAME, name->name);
+		if (n > 1)
+			len = (n - 1) & (PATH_NAME - 1);
+		admin_commit(&s, r, len, 0);
+	}
+	bpf_preempt_enable();
 	return 0;
 }
 
