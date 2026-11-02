@@ -15,7 +15,7 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use libbpf_rs::skel::{OpenSkel, Skel, SkelBuilder};
-use libbpf_rs::{Iter, Link, MapCore, MapFlags, ProgramInput};
+use libbpf_rs::{Iter, Link, MapCore, MapFlags, MapHandle, ProgramInput};
 
 use crate::bpf::{AgentSkel, AgentSkelBuilder, types};
 use crate::container;
@@ -209,6 +209,7 @@ pub fn run(out_path: &str, poll: Duration) {
     let watcher = Watcher::new();
     watcher.host(&mut buf, jiffies);
     watch_sockets(&skel, &mut buf, jiffies);
+    register_objects(&skel);
     push_cgroups(&mut buf, jiffies, Path::new("/sys/fs/cgroup"), "", &watcher);
     let mut hashes = Hasher::new();
     push_snapshot(&skel, &mut buf, &mut hashes);
@@ -533,6 +534,40 @@ impl Watcher {
             );
             return;
         }
+    }
+}
+
+fn register_objects(skel: &AgentSkel) {
+    let object = skel.object();
+    for map in object.maps() {
+        let id = map.info().unwrap().info.id;
+        skel.maps
+            .our_maps
+            .update(&id.to_ne_bytes(), &[1], MapFlags::ANY)
+            .unwrap();
+    }
+    for prog in object.progs().filter(|p| p.autoload()) {
+        let mut info = libbpf_rs::libbpf_sys::bpf_prog_info::default();
+        let mut len = u32::try_from(size_of_val(&info)).unwrap();
+        let ret = unsafe {
+            libbpf_rs::libbpf_sys::bpf_prog_get_info_by_fd(
+                prog.as_fd().as_raw_fd(),
+                &mut info,
+                &mut len,
+            )
+        };
+        assert_eq!(ret, 0, "bpf_prog_get_info_by_fd");
+        skel.maps
+            .our_progs
+            .update(&info.id.to_ne_bytes(), &[1], MapFlags::ANY)
+            .unwrap();
+    }
+    for map in [
+        &skel.maps.our_maps,
+        &skel.maps.our_progs,
+        &skel.maps.unix_watch,
+    ] {
+        MapHandle::try_from(map).unwrap().freeze().unwrap();
     }
 }
 

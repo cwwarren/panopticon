@@ -721,6 +721,16 @@ impl Decoder {
                 .raw("ns", &ns_names(a0))
                 .num("target_ns", a1),
             op::ADMIN_USERNS => obj.str("op", "userns_create").num("euid", a0),
+            op::ADMIN_KILL => obj
+                .str("op", "kill")
+                .num("target_proc", a0)
+                .num("target_pid", a1)
+                .num("signal", a2),
+            op::ADMIN_BPF_ACCESS => obj
+                .str("op", "bpf_access")
+                .str("object", if a0 == 0 { "map" } else { "prog" })
+                .num("id", a1)
+                .str("fmode", &format!("{a2:#x}")),
             other => panic!("unknown admin op {}", other.0),
         }
     }

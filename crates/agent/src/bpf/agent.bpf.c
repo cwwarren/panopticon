@@ -85,6 +85,8 @@ enum admin_op {
 	ADMIN_NS_CREATE,
 	ADMIN_SETNS,
 	ADMIN_USERNS,
+	ADMIN_KILL,
+	ADMIN_BPF_ACCESS,
 };
 
 enum limits {
@@ -447,6 +449,20 @@ struct {
 	__type(key, struct inode_key);
 	__type(value, __u8);
 } cwd_seen SEC(".maps");
+
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__uint(max_entries, 256);
+	__type(key, __u32);
+	__type(value, __u8);
+} our_maps SEC(".maps");
+
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__uint(max_entries, 256);
+	__type(key, __u32);
+	__type(value, __u8);
+} our_progs SEC(".maps");
 
 struct {
 	__uint(type, BPF_MAP_TYPE_SK_STORAGE);
@@ -1610,6 +1626,37 @@ NS_INSTALL(pidns_install, 0x20000000)
 NS_INSTALL(timens_install, 0x00000080)
 NS_INSTALL(userns_install, 0x10000000)
 NS_INSTALL(utsns_install, 0x04000000)
+
+#define KILL_SIGNALS ((1ULL << 1) | (1ULL << 2) | (1ULL << 3) | (1ULL << 9) | (1ULL << 15) | (1ULL << 19))
+
+SEC("lsm/task_kill")
+int BPF_PROG(on_kill, struct task_struct *p, struct kernel_siginfo *info, int sig, const struct cred *cred)
+{
+	if (sig > 0 && sig < 64 && (KILL_SIGNALS & (1ULL << sig)) &&
+	    p->tgid != (bpf_get_current_pid_tgid() >> 32))
+		admin_emit(ADMIN_KILL, p->group_leader->thread_pid->ino, p->tgid, sig, 0);
+	return 0;
+}
+
+SEC("lsm/bpf_map")
+int BPF_PROG(on_bpf_map, struct bpf_map *map, unsigned int fmode)
+{
+	__u32 id = map->id;
+
+	if ((bpf_get_current_pid_tgid() >> 32) != agent_tgid && bpf_map_lookup_elem(&our_maps, &id))
+		admin_emit(ADMIN_BPF_ACCESS, 0, id, fmode, 0);
+	return 0;
+}
+
+SEC("lsm/bpf_prog")
+int BPF_PROG(on_bpf_prog, struct bpf_prog *prog)
+{
+	__u32 id = prog->aux->id;
+
+	if ((bpf_get_current_pid_tgid() >> 32) != agent_tgid && bpf_map_lookup_elem(&our_progs, &id))
+		admin_emit(ADMIN_BPF_ACCESS, 1, id, 0, 0);
+	return 0;
+}
 
 SEC("lsm/userns_create")
 int BPF_PROG(on_userns_create, const struct cred *cred)
