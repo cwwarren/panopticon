@@ -318,9 +318,13 @@ struct file_seen {
 	__u64 repeats;
 };
 
+#define FILE_DEAD ((__u64)-1)
+#define EEXIST 17
+
 struct {
-	__uint(type, BPF_MAP_TYPE_LRU_HASH);
-	__uint(max_entries, 4096);
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__uint(map_flags, BPF_F_NO_PREALLOC);
+	__uint(max_entries, 16384);
 	__type(key, struct file_key);
 	__type(value, struct file_seen);
 } file_seen SEC(".maps");
@@ -1059,12 +1063,14 @@ int BPF_PROG(on_inotify_event, struct fsnotify_mark *mark, __u32 mask, struct in
 	struct inode *obj = dir ? dir : inode;
 	struct task_struct *leader;
 	struct file_seen *seen, fresh = {};
+	struct file_repeat_rec *rr;
 	struct file_key k = {};
 	struct unwatch_rec *u;
 	struct file_rec *r;
 	struct ring_slot s;
-	__u64 now;
+	__u64 now, j, n;
 	__u32 len = 0;
+	__u8 flags = 0;
 	__s32 wd;
 
 	if (!our_group || (__u64)mark->group != our_group)
@@ -1091,19 +1097,34 @@ int BPF_PROG(on_inotify_event, struct fsnotify_mark *mark, __u32 mask, struct in
 	k.child_ino = inode->i_ino;
 	k.dev = obj->i_sb->s_dev;
 	k.mask = mask;
+	bpf_preempt_disable();
 	seen = bpf_map_lookup_elem(&file_seen, &k);
-	if (seen && (__s64)(now - seen->jiffies) < (__s64)file_window) {
-		__sync_fetch_and_add(&seen->repeats, 1);
-		return 0;
-	}
 	if (seen) {
-		seen->jiffies = now;
+		j = *(volatile __u64 *)&seen->jiffies;
+		if (j != FILE_DEAD && (__s64)(now - j) < (__s64)file_window) {
+			n = __sync_fetch_and_add(&seen->repeats, 1);
+			barrier_var(n);
+			if (*(volatile __u64 *)&seen->jiffies == FILE_DEAD &&
+			    (n = __sync_lock_test_and_set(&seen->repeats, 0))) {
+				rr = reserve(&ring_file, CLASS_FILE, FILE_RING, sizeof(*rr), &s);
+				if (rr) {
+					rr->k = k;
+					rr->count = n;
+					commit(&s, &rr->h, sizeof(*rr), REC_FILE_REPEAT, 0);
+				}
+			}
+			bpf_preempt_enable();
+			return 0;
+		}
+		if (j != FILE_DEAD)
+			__sync_val_compare_and_swap(&seen->jiffies, j, now);
 	} else {
 		fresh.jiffies = now;
-		bpf_map_update_elem(&file_seen, &k, &fresh, BPF_NOEXIST);
+		n = bpf_map_update_elem(&file_seen, &k, &fresh, BPF_NOEXIST);
+		if (n && n != -EEXIST)
+			flags = FLAG_SATURATED;
 	}
 
-	bpf_preempt_disable();
 	r = reserve(&ring_file, CLASS_FILE, FILE_RING, FILE_MAX, &s);
 	if (r) {
 		fill_actor(&r->a);
@@ -1119,7 +1140,7 @@ int BPF_PROG(on_inotify_event, struct fsnotify_mark *mark, __u32 mask, struct in
 				len = 0;
 		}
 		r->name_len = len;
-		commit(&s, &r->h, sizeof(*r) + len, REC_FILE, 0);
+		commit(&s, &r->h, sizeof(*r) + len, REC_FILE, flags);
 	}
 	bpf_preempt_enable();
 	return 0;
@@ -1131,15 +1152,24 @@ int file_flush(struct bpf_iter__bpf_map_elem *ctx)
 	struct file_key *k = ctx->key;
 	struct file_seen *v = ctx->value;
 	struct file_repeat_rec r = {};
+	__u64 now = bpf_jiffies64(), j;
+	bool claimed;
 
-	if (!k || !v || !v->repeats)
+	if (!k || !v)
 		return 0;
-	r.count = __sync_lock_test_and_set(&v->repeats, 0);
-	r.h.len = sizeof(r);
-	r.h.type = REC_FILE_REPEAT;
-	r.h.jiffies = bpf_jiffies64();
 	r.k = *k;
-	bpf_seq_write(ctx->meta->seq, &r, sizeof(r));
+	j = *(volatile __u64 *)&v->jiffies;
+	claimed = j != FILE_DEAD && (__s64)(now - j) >= (__s64)file_window &&
+		  __sync_val_compare_and_swap(&v->jiffies, j, FILE_DEAD) == j;
+	r.count = __sync_lock_test_and_set(&v->repeats, 0);
+	if (r.count) {
+		r.h.len = sizeof(r);
+		r.h.type = REC_FILE_REPEAT;
+		r.h.jiffies = now;
+		bpf_seq_write(ctx->meta->seq, &r, sizeof(r));
+	}
+	if (claimed)
+		bpf_map_delete_elem(&file_seen, &r.k);
 	return 0;
 }
 
