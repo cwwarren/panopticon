@@ -53,8 +53,8 @@ recorded. Other agents' cells are copied from the open-source survey.
 | Item | Panopticon | How, or why not | Falco | Tetragon | Tracee | Datadog |
 |---|---|---|---|---|---|---|
 | TCP connect/accept/listen | ✓ | `fexit` on `tcp_v{4,6}_connect`, `inet_csk_accept`, `inet_listen` | ✓ | ✓ | ✓ | ✓ |
-| UDP flows | ✓ | First send per (socket, destination), IPv4 and IPv6 | partial | partial | partial | partial |
-| DNS query/answer | ✓ | Query payload at send, answers on tagged sockets, IPv4 and IPv6 | ✗ | ✗ | ✓ | ✓ |
+| UDP flows | ✓ | First send per (socket, destination), IPv4 and IPv6, from `fentry/udp_send_skb`: real source address even on unconnected sockets | partial | partial | partial | partial |
+| DNS query/answer | ✓ | Query payload from the skb (a sender cannot rewrite it after the send, unlike a buffer read), answers on tagged sockets, IPv4 and IPv6 | ✗ | ✗ | ✓ | ✓ |
 | raw/packet sockets | ✓ | Family constructors `packet_create`, `raw_sk_init`, `rawv6_init_sk` | ✓ | partial | partial | ✓ |
 | unix sockets | partial | Connects to container runtime sockets only | ✓ | partial | ✓ | partial |
 | IPv6 | ✓ | All network records | ✓ | ✓ | ✓ | ✓ |
@@ -73,7 +73,7 @@ recorded. Other agents' cells are copied from the open-source survey.
 | mount/umount | ✓ | `sb_mount`, `move_mount`, `sb_pivotroot`, `sb_umount` | ✓ | partial | ✓ | partial |
 | namespaces | ✓ | `create_new_namespaces`, eight `*ns_install` callbacks, `userns_create` | ✓ | ✓ | ✓ | partial |
 | kexec | ✓ | Privileged loads through the kernel read hooks | partial | partial | ✓ | partial |
-| sysctl write | ✓ | `fentry/proc_sys_write`: name and value | partial | partial | partial | ✓ |
+| sysctl write | ✓ | `fexit/proc_sys_write`: name, result, and the value the kernel holds afterwards for value-type handlers | partial | partial | partial | ✓ |
 | time change | ✓ | `settime` | partial | partial | ✓ | partial |
 | keyring | ✗ | Low demand | partial | partial | ✓ | partial |
 | io_uring | ✓ | Semantic hooks see io_uring operations (open, connect verified); setup recorded as an anonymous inode | partial | partial | partial | partial |
@@ -184,16 +184,18 @@ of Sigma, Elastic and Falco Linux rules that need the capability.
 
 ## What parity cost
 
-Every hook added for parity fires only on the operation it records, except one:
+Most hooks added for parity fire only on the operation they record. Four also run for activity that
+is usually unrelated; run 3 measured each:
 
 | Hook | Fires on | Measured |
 |---|---|---|
-| `lsm/unix_stream_connect` | every unix stream connect | 19 ns per connect (`bpf_stats`) |
-| `tp_btf/sched_process_exit` | every process exit (last thread) | 70 ns per exit |
+| `lsm/unix_stream_connect` | every unix stream connect | 19 ns of BPF; +9 ns end to end on a connect loop |
+| `lsm/task_kill` | every signal a process sends | 7 ns of BPF; +7 ns end to end on a `tgkill` loop (103 → 110 ns) |
+| `ptrace_access_check` | every ptrace-mode check, including `/proc/<pid>/stat` reads | 14–18 ns of BPF per check |
+| `__nf_conntrack_confirm` | every new connection on a host with conntrack | 8–9 ns of BPF; emits only for NAT |
+| `tp_btf/sched_process_exit` | every process exit (last thread) | 114 ns of BPF per exit |
 | admin LSM hooks, `proc_sys_write`, namespace callbacks | the operation itself | not measurable on the workloads |
 | `packet_create`, `raw_sk_init`, `rawv6_init_sk`, `inet{,6}_bind` (UDP) | socket creation of that family, UDP binds | not measurable on the workloads |
-| `ptrace_access_check` | every ptrace-mode check, including `/proc/<pid>/stat` reads | 15 ns per check |
-| `nf_nat_setup_info` | new NAT bindings | +46 ns per connection for an empty program (`docs/design.md`) |
 
 Container metadata, hashes and path resolution run in userspace, once per container, distinct binary
 or directory, at idle priority where they read files. The end-to-end overhead table in

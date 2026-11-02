@@ -205,7 +205,7 @@ Fork produces no records. Process exit produces one record when the last thread 
   directory from `/proc/<pid>/cwd`.
 - One exit record when a process's last thread exits (`sched_process_exit` with `group_dead`): wait
   status, total CPU time, start time (`start_boottime`, converted with the boottime reference in the
-  clock record). 70 ns per process exit.
+  clock record). 114 ns of BPF per process exit (run 3, `bpf_stats`).
 - One login record when `/proc/self/loginuid` is set (PAM `pam_loginuid`): new loginuid and session.
 - Processes that exist when the agent starts are emitted once by a BPF task iterator, in the same
   record format. The verifier rejects `bpf_d_path` on `mm->exe_file` (a walked, untrusted pointer)
@@ -559,9 +559,9 @@ costs nothing measurable (52.10 against 52.29 ns per emitting `getppid`).
 | 2026-11-02 | Keep fork-time task storage | 246 ns per fork (604 ns with 16 forkers), about 0.2% of a fork+exec; deriving the spawner at exec from `real_parent` loses it on reparenting, the double-fork case |
 | 2026-11-02 | Coalesce sensitive-file events per (process, image, file, mask) per second in the kernel; flush counts with a map iterator | 3.3M-open flood: 3 records and exact counts, 0 drops; Falco: 49% drops, 4% of alerts delivered |
 | 2026-11-02 | Snapshot executable paths from `/proc/<pid>/exe` | Verifier rejects `bpf_d_path` on `mm->exe_file`; trusted-file kfuncs are LSM-only |
-| 2026-11-02 | Record process exits after all (reverses the exit half of the fork/exit row) | Falco, Tetragon, Tracee, Datadog and 8 commercial sensors export exits (`docs/research/`); one record per process, 70 ns |
+| 2026-11-02 | Record process exits after all (reverses the exit half of the fork/exit row) | Falco, Tetragon, Tracee, Datadog and 8 commercial sensors export exits (`docs/research/`); one record per process, 114 ns |
 | 2026-11-02 | One per-ring busy flag in every class's reserve/commit, instead of split rings for multi-context classes | 52.10 vs 52.29 ns per emitting `getppid` (medians of 11 interleaved pinned runs); safe under any nesting, one code path |
-| 2026-11-02 | Admin operations from LSM hooks and single-purpose kernel functions that fire only on the operation | Coverage pass: 36 of 43 probe actions observed across all classes, before signals and truncation were added; the misses fail before the security check, are unhooked hot paths, or sit outside watched paths |
+| 2026-11-02 | Admin operations from LSM hooks and single-purpose kernel functions that fire only on the operation | Coverage pass (run 3): 38 of 43 probe actions observed across all classes; the misses fail before the security check (kexec, settime), are unhooked hot paths (`mprotect`, `mmap` exec), or sit outside watched paths (a symlink in `/tmp`) |
 | 2026-11-02 | Container metadata from the runtimes' state files, not their APIs | Read once per container; no runtime API calls, no per-record work; docker, containerd, CRI-O, podman |
 | 2026-11-02 | Hash executables and changed files in a `SCHED_IDLE` worker that drops the pages it read | 200 MB binary: 0 bytes left resident (190.8 MB without); 4.07 GB of running binaries in ~25 s of idle time |
 | 2026-11-02 | Persistence and integrity as directory change marks; read marks only on credentials | Catches files created after startup and rename-replacement; `/etc` reads stay unmarked |
@@ -592,58 +592,82 @@ shipping the stream off the host.
 ### Against Falco
 
 `bench/falco.sh overhead` with the `pano` condition, results in `bench/results/prototype-2026-11-02/`
-(run 2; run 1, taken before the file-class fixes below, agrees within noise). Medians of 3
-interleaved 10-second runs. "Noop" is empty programs on the semantic hooks: the noise floor plus the
-cost of attaching anything. Agent CPU below 0.001 cores is under the measurement's resolution.
-Delivered is the share of the workload's operations present in the output; for the `/etc/shadow`
-flood that is records plus repeat counts.
+(run 3, at `0e9a541`; runs 1 and 2 are earlier builds). Medians of 3 interleaved 10-second runs.
+"Noop" is empty programs on the semantic hooks: the noise floor plus the cost of attaching anything.
+Delivered is the share of the workload's operations present in the output; for exec that is an exec
+and an exit record per run, for the `/etc/shadow` flood records plus repeat counts. The connect rows
+were measured again after NAT moved to conntrack confirmation (`b4b1c20`), with the agent started
+40 s before the first workload so the one-time hash of running executables was over
+(`summary-run3-connect.md`); their Falco column is from run 3.
 
 | Workload | Falco default | pano | Noop | Agent CPU, Falco / pano | Drops, Falco / pano | Delivered, pano |
 |---|---|---|---|---|---|---|
-| getppid, 1 thread | +57.8%, +23 ns | −0.5%, 0 ns | −0.5% | 0.005 / 0.001 | 0% / 0% | n/a |
-| exec, 1 thread | +7.2%, +9.8 µs | +1.1%, +1.5 µs | +0.9%, +1.2 µs | 0.064 / 0.001 | 0% / 0% | 100% |
-| exec, 16 threads | +4.5%, +12.5 µs | +1.2%, +3.2 µs | +1.0%, +2.7 µs | 0.600 / 0.005 | 0% / 0% | 100% |
-| connect+accept, 1 thread | +8.5%, +964 ns | +1.0%, +110 ns | +0.5%, +55 ns | 0.154 / 0.005 | 0% / 0% | 100% |
-| connect+accept, 16 threads | +8.3%, +1,403 ns | +1.1%, +179 ns | +0.4%, +74 ns | 1.00 / 0.048 | 30% / 0% | 100% |
-| UDP sendto, 1 thread | +11.4%, +198 ns | +1.6%, +29 ns | +0.7%, +12 ns | 0.146 / <0.001 | 0% / 0% | n/a |
-| UDP sendto, 16 threads | +17.2%, +347 ns | +1.8%, +37 ns | +0.4%, +9 ns | 1.00 / <0.001 | 36% / 0% | n/a |
-| open+close, unlisted file | +70.3%, +320 ns | −0.2%, −1 ns | +2.4%, +11 ns | 1.00 / <0.001 | 25% / 0% | n/a |
-| open+close of `/etc/shadow` | +54.7%, +264 ns | +23.0%, +111 ns | +2.7%, +13 ns | 1.11 / 0.001 | 49% / 0% | 100% (Falco 4.4%) |
-| kernel build, `-j32` (run 1) | +2.5% | +0.1% | +0.1% | 0.481 / 0.002 | 0% / 0% | n/a |
+| getppid, 1 thread | +58.2%, +23 ns | +0.6%, 0 ns | +1.1% | 0.005 / 0.001 | 0% / 0% | n/a |
+| exec, 1 thread | +5.8%, +7.9 µs | +1.1%, +1.4 µs | +0.1%, +0.1 µs | 0.065 / 0.001 | 0% / 0% | 100% |
+| exec, 16 threads | +2.2%, +6.2 µs | −0.2% (noise) | −0.9% | 0.601 / 0.008 | 0% / 0% | 100% |
+| connect+accept, 1 thread | +8.8%, +1,002 ns | +1.4%, +164 ns | +0.5%, +56 ns | 0.155 / 0.005 | 0% / 0% | 100% |
+| connect+accept, 16 threads | +8.1%, +1,362 ns | +2.5%, +416 ns | +0.5%, +91 ns | 1.00 / 0.052 | 30% / 0% | 100% |
+| UDP sendto, 1 thread | +12.6%, +217 ns | +1.1%, +19 ns | +0.2%, +3 ns | 0.146 / <0.001 | 0% / 0% | n/a |
+| UDP sendto, 16 threads | +18.2%, +366 ns | +0.6%, +12 ns | +0.6%, +12 ns | 1.00 / 0.001 | 36% / 0% | n/a |
+| open+close, unlisted file | +70.1%, +320 ns | −0.6%, −3 ns | +1.9%, +8 ns | 1.00 / <0.001 | 25% / 0% | n/a |
+| open+close of `/etc/shadow` | +55.1%, +265 ns | +24.9%, +120 ns | +2.9%, +14 ns | 1.11 / 0.001 | 49% / 0% | 100% (Falco 4.4%) |
+| unix connect, 1 thread | +38.4%, +878 ns | +0.4%, +9 ns | +1.0%, +23 ns | 0.450 / 0.001 | 0% / 0% | n/a |
+| signal (`tgkill`), 1 thread | +27.2%, +28 ns | +7.0%, +7 ns | +0.1%, 0 ns | 0.005 / <0.001 | 0% / 0% | n/a |
+| kernel build, `-j32` | +2.1% | +0.2% | −0.3% | 0.48 / 0.06 | 0% / 0% | n/a |
 
-Memory: 22–25 MB RSS, of which 18 MiB are the mapped rings, against Falco's 347 MB.
+connect+accept with 16 threads measured +179, +251 and +416 ns in three runs; with the NAT program
+attached and with it hidden, interleaved medians of 4 runs differ by 0.4%, so the spread is this host's
+(k3s and other services run on it). The kernel build's 0.06 cores are idle-priority hashing of the
+tools the build compiles and runs.
+
+Startup: the agent hashes every running executable once (91 binaries, 4.07 GB here), about 2.2
+core-seconds over the first 25 s at `SCHED_IDLE` and idle I/O priority. Idle priority does not stop it
+from competing through shared caches, memory bandwidth and SMT siblings: a connect+accept loop running
+during that window measured +409 ns instead of +164 ns.
+
+Memory: 31–34 MB RSS, against Falco's 348 MB.
 
 ### Per-program cost
 
-`bench/falco.sh bpfstats` (run 2): mean run time per invocation from `kernel.bpf_stats_enabled`,
-which includes part of its own clock reads and excludes the trampoline.
+`bench/falco.sh bpfstats` (run 3): mean run time per invocation from `kernel.bpf_stats_enabled`,
+which includes part of its own clock reads and any time the program spent preempted, and excludes the
+trampoline. No program recorded a recursion miss in any workload.
 
 | Program | 1 thread | 16 threads |
 |---|---|---|
-| `on_fork` (task storage allocation) | 245 ns | 596 ns |
-| `on_exec` (record with path and argv) | 450 ns | 571 ns |
-| `on_tcp4_connect` | 20 ns | 26 ns |
-| `on_accept` | 20 ns | 24 ns |
-| `on_udp_send` | 17 ns | 18 ns |
-| `on_inotify_event` | 23 ns | n/a |
-| `file_flush`, per map entry once per second | 20–30 ns | n/a |
+| `on_fork` (task storage allocation) | 274 ns | 603 ns |
+| `on_exec` (record with path, argv, working directory, executable flags) | 712 ns | 943 ns |
+| `on_exit` | 114 ns | 163 ns |
+| `on_tcp4_connect` | 25 ns | 29 ns |
+| `on_accept` | 25 ns | 28 ns |
+| `on_udp_send` (`udp_send_skb`) | 12 ns | 82 ns |
+| `on_inotify_event` | 28 ns | n/a |
+| `on_unix_connect` | 19 ns | n/a |
+| `on_kill` | 7 ns | n/a |
+| `on_nat` (`__nf_conntrack_confirm`, `b4b1c20`) | 8–9 ns | n/a |
+| `file_flush`, per map entry once per second | 28–54 ns | n/a |
 
-A fork+exec costs 0.7 µs of our BPF on one thread, against 1.6–2.2 µs for Falco's exec programs alone.
+A fork, exec and exit cost 1.1 µs of our BPF on one thread, against 1.6–2.2 µs for Falco's exec
+programs alone. `on_exec` grew from 450 ns in run 2 with the working directory, upper-layer and stdio
+fields; the exec workload's end-to-end cost did not move (+1.1% in both runs).
 
 ### Against the target
 
 - Unrelated activity costs nothing measurable (getppid, unlisted opens, the kernel build). Falco adds
   23 ns to every syscall and 320 ns to every open.
-- Recorded events cost 4–9× less added time per operation than Falco (exec 3.9–6.7×, connect
-  7.8–8.8×, UDP 6.8–9.4×), with no drops where Falco drops 25–49%. What remains is mostly the price
-  of attaching anything: pano is 0.2–1.4 points above the noop floor.
-- Agent CPU is 21× lower on connect+accept with 16 threads, the only workload where every operation
-  becomes a record, 120× lower on exec with 16 threads, 200× on the kernel build, and more than
-  1,000× on the UDP and open floods.
-- Memory is 14× lower.
+- Four hooks run for activity that is usually unrelated, at about the trampoline floor: unix stream
+  connects +9 ns, signals +7 ns, ptrace-mode access checks 14–18 ns of BPF (these include the
+  `/proc/<pid>/stat` reads of `ps` and `top`), and one 8–9 ns check per new connection for NAT.
+- Recorded events cost less added time per operation than Falco: exec 5.5×, connect 6.1× (1 thread)
+  and 3.3× (16 threads), UDP 11× and 30×, unix connects about 100×, with no drops where Falco drops
+  25–49%. On `/etc/shadow` the ratio is 2.2× because most of the remaining cost is the kernel's own
+  inotify event, and pano delivers every access where Falco delivers 4.4%.
+- Agent CPU is 19× lower on connect+accept with 16 threads, 75× on exec with 16 threads, 8× on the
+  kernel build, and more than 1,000× on the UDP, open and unix floods.
+- Memory is 10× lower.
 
-The 100× holds for unrelated activity and for agent CPU. Per recorded event it is 4–9×, and the
-floor there is the trampoline plus the record write.
+For unrelated activity and agent CPU the gap is one to three orders of magnitude. Per recorded event
+it is 2–30×, and the floor there is the trampoline plus the record write.
 
 ### Found by the functional runs
 
