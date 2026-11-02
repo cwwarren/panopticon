@@ -5,6 +5,7 @@ mod container;
 mod decode;
 mod hash;
 mod run;
+mod ship;
 mod nat_bpf {
     include!(concat!(env!("OUT_DIR"), "/nat.skel.rs"));
 }
@@ -20,10 +21,11 @@ fn main() {
     match args.as_slice() {
         ["run", out] => run::run(out, Duration::from_millis(10)),
         ["run", out, poll_ms] => run::run(out, Duration::from_millis(poll_ms.parse().unwrap())),
-        ["decode", path] => decode::decode(path),
+        ["decode", path] => decode::decode(path, decode::Format::Json),
+        ["decode", path, "otlp"] => decode::decode(path, decode::Format::Otlp),
         _ => {
             eprintln!(
-                "usage: panopticon run <output> [poll-ms]\n       panopticon decode <output>"
+                "usage: panopticon run <file | http://collector:4318> [poll-ms]\n       panopticon decode <file> [otlp]"
             );
             process::exit(2);
         }

@@ -21,6 +21,7 @@ use crate::bpf::{AgentLinks, AgentSkel, AgentSkelBuilder, types};
 use crate::container;
 use crate::hash::{self, Hasher};
 use crate::nat_bpf::{NatLinks, NatSkel, NatSkelBuilder};
+use crate::ship::Shipper;
 use crate::wire;
 
 static STOP: AtomicBool = AtomicBool::new(false);
@@ -209,10 +210,8 @@ pub fn run(out_path: &str, poll: Duration) {
         .unwrap();
 
     let mut rings = map_rings(&skel, ncpus, nclasses);
-    File::create(out_path).unwrap();
-    let mut out = fs::OpenOptions::new().append(true).open(out_path).unwrap();
+    let mut sink = Sink::open(out_path);
     let mut buf = Vec::with_capacity(4 << 20);
-    buf.extend_from_slice(wire::MAGIC);
     let mut jiffies = push_clock(&skel, &mut buf);
     push_meta(&mut buf, jiffies, ncpus, hz);
     let watcher = Watcher::new();
@@ -225,7 +224,7 @@ pub fn run(out_path: &str, poll: Duration) {
     let mut hashes = Hasher::new();
     push_snapshot(&skel, &mut buf, &mut hashes);
     hashes.release_backlog();
-    out.write_all(&buf).unwrap();
+    sink.write(&buf);
     buf.clear();
     eprintln!("ready");
 
@@ -260,7 +259,7 @@ pub fn run(out_path: &str, poll: Duration) {
             last_clock = Instant::now();
         }
         if !buf.is_empty() {
-            out.write_all(&buf).unwrap();
+            sink.write(&buf);
             buf.clear();
         }
         if stop {
@@ -275,6 +274,41 @@ pub fn run(out_path: &str, poll: Duration) {
         watcher.paths.borrow().len(),
         watcher.grow.borrow().len()
     );
+    sink.finish();
+}
+
+enum Sink {
+    File(File),
+    Otlp(Shipper),
+}
+
+impl Sink {
+    fn open(target: &str) -> Self {
+        if target.starts_with("http://") {
+            return Sink::Otlp(Shipper::new(target));
+        }
+        File::create(target).unwrap();
+        let mut file = fs::OpenOptions::new().append(true).open(target).unwrap();
+        file.write_all(wire::MAGIC).unwrap();
+        Sink::File(file)
+    }
+
+    fn write(&mut self, buf: &[u8]) {
+        match self {
+            Sink::File(file) => file.write_all(buf).unwrap(),
+            Sink::Otlp(shipper) => shipper.push(buf),
+        }
+    }
+
+    fn finish(self) {
+        if let Sink::Otlp(shipper) = self {
+            let s = shipper.finish();
+            eprintln!(
+                "otlp: records={} posts={} retries={} lost={}",
+                s.records, s.posts, s.retries, s.lost
+            );
+        }
+    }
 }
 
 fn map_rings(skel: &AgentSkel, ncpus: usize, nclasses: usize) -> Vec<Ring> {
