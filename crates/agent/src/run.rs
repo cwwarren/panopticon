@@ -16,6 +16,7 @@ use libbpf_rs::skel::{OpenSkel, Skel, SkelBuilder};
 use libbpf_rs::{Iter, Link, MapCore, MapFlags, ProgramInput};
 
 use crate::bpf::{AgentSkel, AgentSkelBuilder, types};
+use crate::container;
 use crate::wire;
 
 static STOP: AtomicBool = AtomicBool::new(false);
@@ -110,7 +111,14 @@ impl Ring {
                 self.cpu,
                 self.tail
             );
+            let start = out.len();
             out.extend_from_slice(unsafe { std::slice::from_raw_parts(rec, len as usize) });
+            if out[start + 2] == types::rec_type::REC_CGROUP.0 as u8 {
+                let r: types::cgroup_rec = wire::read(&out[start..]);
+                let body = &out[start + size_of::<types::cgroup_rec>()..];
+                let path = String::from_utf8_lossy(&body[..usize::from(r.path_len)]).into_owned();
+                container::push(out, r.h.jiffies, r.id, &path);
+            }
             self.tail += len;
             self.records += 1;
             self.bytes += len;
@@ -496,6 +504,7 @@ fn push_cgroups(buf: &mut Vec<u8>, jiffies: u64, dir: &Path, rel: &str) {
             path.as_bytes(),
         ],
     );
+    container::push(buf, jiffies, meta.ino(), path);
     let entries = match fs::read_dir(dir) {
         Ok(entries) => entries,
         Err(err) if err.kind() == io::ErrorKind::NotFound => return,

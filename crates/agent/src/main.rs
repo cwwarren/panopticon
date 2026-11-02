@@ -1,6 +1,7 @@
 mod bpf {
     include!(concat!(env!("OUT_DIR"), "/agent.skel.rs"));
 }
+mod container;
 mod decode;
 mod run;
 mod wire;

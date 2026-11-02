@@ -7,6 +7,7 @@ pub const REC_META: u8 = 100;
 pub const REC_CLOCK: u8 = 101;
 pub const REC_LOSS: u8 = 102;
 pub const REC_WATCH: u8 = 103;
+pub const REC_CONTAINER: u8 = 104;
 
 pub fn push(out: &mut Vec<u8>, ty: u8, jiffies: u64, parts: &[&[u8]]) {
     let body: usize = parts.iter().map(|p| p.len()).sum();

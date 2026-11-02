@@ -9,6 +9,7 @@ dependencies = [
  "libbpf-cargo",
  "libbpf-rs",
  "libc",
+ "serde_json",
 ]
 
 [[package]]

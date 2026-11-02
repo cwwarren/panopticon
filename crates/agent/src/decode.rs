@@ -5,6 +5,7 @@ use std::io::{self, BufWriter, Write};
 use std::net::{Ipv4Addr, Ipv6Addr};
 
 use crate::bpf::types;
+use crate::container;
 use crate::wire::{self, read};
 
 const EXEC: u32 = types::rec_type::REC_EXEC.0;
@@ -26,6 +27,7 @@ const META: u32 = wire::REC_META as u32;
 const CLOCK: u32 = wire::REC_CLOCK as u32;
 const LOSS: u32 = wire::REC_LOSS as u32;
 const WATCH: u32 = wire::REC_WATCH as u32;
+const CONTAINER: u32 = wire::REC_CONTAINER as u32;
 
 const MASKS: [(u32, &str); 14] = [
     (0x1, "access"),
@@ -92,6 +94,7 @@ struct Decoder {
     images: HashMap<(u64, u64), String>,
     watches: HashMap<(u32, u64), String>,
     files: HashMap<FileKey, (types::actor, String)>,
+    containers: HashMap<u64, String>,
 }
 
 struct Obj(String);
@@ -185,6 +188,24 @@ const NAMESPACES: [(u64, &str); 8] = [
     (0x4000_0000, "net"),
 ];
 
+fn container_json(rec: &[u8]) -> (u64, String) {
+    let (cgroup, flags): (u64, u8) = (read(&rec[wire::HDR..]), rec[wire::HDR + 8]);
+    let text = String::from_utf8_lossy(&rec[wire::HDR + 16..]);
+    let mut parts = text.split('\0');
+    let mut field = || quote(parts.next().unwrap_or_default());
+    let (runtime, id, name, image, pod, namespace) =
+        (field(), field(), field(), field(), field(), field());
+    let bit = |b: u8| flags & b != 0;
+    let json = format!(
+        r#"{{"runtime":{runtime},"id":{id},"name":{name},"image":{image},"pod":{pod},"namespace":{namespace},"privileged":{},"host_pid":{},"host_net":{},"sandbox":{}}}"#,
+        bit(container::PRIVILEGED),
+        bit(container::HOST_PID),
+        bit(container::HOST_NET),
+        bit(container::SANDBOX)
+    );
+    (cgroup, json)
+}
+
 fn ns_names(flags: u64) -> String {
     let names: Vec<String> = NAMESPACES
         .iter()
@@ -216,6 +237,10 @@ impl Decoder {
                     i128::from(realtime / 1_000_000) - i128::from(boottime / 1_000_000);
             }
             META => self.hz = u64::from(read::<u32>(&rec[wire::HDR + 4..])),
+            CONTAINER => {
+                let (cgroup, json) = container_json(rec);
+                self.containers.insert(cgroup, json);
+            }
             WATCH => {
                 let (d, ino): (u32, u64) = (read(&rec[wire::HDR..]), read(&rec[wire::HDR + 8..]));
                 self.watches.insert(
@@ -258,6 +283,12 @@ impl Decoder {
             .str("image", &format!("{}:{}", a.image_proc, a.image_seq))
             .str("exe", &self.exe(a))
             .num("cgroup", a.cgroup)
+            .raw(
+                "container",
+                self.containers
+                    .get(&a.cgroup)
+                    .map_or("null", String::as_str),
+            )
             .num("pid", a.pid)
             .num("tid", a.tid)
     }
@@ -303,6 +334,12 @@ impl Decoder {
                                 ..usize::from(boot_len) + usize::from(host_len)],
                         ),
                     )
+            }
+            CONTAINER => {
+                let (cgroup, json) = container_json(rec);
+                Obj::new("container", ts)
+                    .num("cgroup", cgroup)
+                    .raw("container", &json)
             }
             WATCH => {
                 let (d, mask, ino): (u32, u32, u64) = (
@@ -447,6 +484,12 @@ impl Decoder {
             .num("pid", r.pid)
             .num("ppid", r.ppid)
             .num("cgroup", r.cgroup)
+            .raw(
+                "container",
+                self.containers
+                    .get(&r.cgroup)
+                    .map_or("null", String::as_str),
+            )
             .str("path", &path)
             .raw("argv", &format!("[{}]", args.join(",")))
             .num("uid", r.uid)
