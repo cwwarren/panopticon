@@ -506,6 +506,33 @@ the agent's maps or programs, the first step of map-tampering attacks, is record
 sent to the agent. Prevention is out of scope; an agent that is killed stops emitting clock records,
 which the collector sees within a second.
 
+## Formal model
+
+`formal/` holds TLA+ models of the concurrency the agent depends on, model-checked with TLC, and a
+TLAPS proof of the ring for every size. `formal/check.sh` runs all of it and fails unless every safe
+configuration passes and every unsafe variant fails with its expected property; `formal/README.md`
+lists the kernel and BPF guarantees each model relies on, with sources.
+
+| Model | Holds as written | What the unsafe variants show |
+|---|---|---|
+| Ring (614,228 states) | No overwrite, no partial read, records contiguous within size + slack, every record consumed, dropped or still in the ring; the producer finishes within `max + 2` steps even if the consumer never runs | Head store without release: partial read. Tail store without release: overwrite. One byte written past `max`: overwrite with every store inside the map value |
+| Nested producers (up to 3,950,593 states) | Busy flag with exchange and atomic drop counters, under task, softirq, hardirq and NMI nesting in any order: no overlapping writes, one commit per reservation, the flag never leaks, exact accounting | No flag: overlap. Non-atomic drop counter: a lost count. A plain load/store flag is safe only for last-in first-out nesting |
+| File coalescing (1,988,080 states with eviction) | Every event is counted once, as a record, a flushed repeat or a pending count; only eviction loses counts | `BPF_ANY` insert loses a pending count without eviction; eviction can move a count to another key |
+| Host safety (1,246,989 states) | Every hook invocation finishes in a bounded number of steps; host threads keep making progress whether the agent runs, stalls or dies; all state stays bounded | A producer that waited for ring space would block the host |
+| UDP dedup (16,693,624 states) | With one sender, records ≤ 16 + DNS queries; a send to a destination outside the last 4 always emits | Two senders on one socket exceed the cap |
+
+TLAPS proves the ring invariant inductive and that it implies no overwrite and containment for every
+ring size (83 obligations). TLC bounds are small: rings of 4–8 cells, 2 CPUs, 1–2 invocations per
+context.
+
+Found by the models and fixed in the code: recursion misses were not reported; the final drain ran
+before the programs were detached; the UDP destination count wrapped; the coalescing window test
+underflowed when an invocation spanned a jiffy. Found and documented: the two-sender UDP overshoot,
+eviction moving a count to another key, a one-jiffy lag that can add a record to a window or move
+its start back by a jiffy, and that the shutdown wait is one poll interval, so a program preempted
+before `reserve()` for longer than that could still commit after the final drain. The busy flag
+costs nothing measurable (52.10 against 52.29 ns per emitting `getppid`).
+
 ## Decision log
 
 | Date | Decision | Evidence |
