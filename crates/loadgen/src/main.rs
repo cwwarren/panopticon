@@ -4,7 +4,7 @@ use std::io::{Error, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream, UdpSocket};
 use std::os::fd::{AsRawFd, FromRawFd, RawFd};
 use std::os::unix::fs::FileExt;
-use std::os::unix::net::UnixStream;
+use std::os::unix::net::{UnixListener, UnixStream};
 use std::os::unix::process::CommandExt;
 use std::process::{self, Command};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
@@ -33,7 +33,7 @@ fn main() {
         }
         _ => {
             eprintln!(
-                "usage: loadgen bench <getppid|exec|connect|udp|open> <threads> <secs> [path, {{}} = thread index]\n       loadgen act <action>"
+                "usage: loadgen bench <getppid|exec|connect|unix|udp|open> <threads> <secs> [path, {{}} = thread index]\n       loadgen act <action>"
             );
             process::exit(2);
         }
@@ -89,6 +89,18 @@ fn worker(workload: &str, rest: &[&str], index: usize, stop: &AtomicBool) -> u64
                 drop(server);
                 ops += 1;
             }
+        }
+        "unix" => {
+            let path = env::temp_dir().join(format!("pano-unix-{}-{index}", process::id()));
+            let listener = UnixListener::bind(&path).unwrap();
+            while !stop.load(Relaxed) {
+                let client = UnixStream::connect(&path).unwrap();
+                let (server, _) = listener.accept().unwrap();
+                drop(client);
+                drop(server);
+                ops += 1;
+            }
+            fs::remove_file(&path).unwrap();
         }
         "udp" => {
             let sink = UdpSocket::bind("127.0.0.1:0").unwrap();

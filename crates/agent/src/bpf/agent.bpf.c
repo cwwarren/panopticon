@@ -9,12 +9,22 @@ char LICENSE[] SEC("license") = "GPL";
 
 #define AF_INET 2
 #define AF_INET6 10
+#define AF_PACKET 17
 #define DNS_PORT 53
+#define PTRACE_MODE_ATTACH 0x02
+#define NS_FLAGS (0x00000080 | 0x00020000 | 0x02000000 | 0x04000000 | 0x08000000 | 0x20000000 | 0x40000000)
+#define IS_ERR_PTR(p) ((unsigned long)(p) >= (unsigned long)-4095)
+#define ADMIN_STR 256
+#define BPF_NAME 16
+#define SYSCTL_DEPTH 8
+#define SYSCTL_NAME 64
+#define SYSCTL_VALUE 64
 
 enum ring_class {
 	CLASS_PROC,
 	CLASS_NET,
 	CLASS_FILE,
+	CLASS_ADMIN,
 	NR_CLASSES,
 };
 
@@ -29,12 +39,39 @@ enum rec_type {
 	REC_DNS_ANSWER,
 	REC_FILE,
 	REC_FILE_REPEAT,
+	REC_EXIT,
+	REC_LOGIN,
+	REC_ADMIN,
+	REC_RAW_SOCKET,
+	REC_UNIX_CONNECT,
 };
 
 enum rec_flag {
 	FLAG_SNAPSHOT = 1,
 	FLAG_TRUNCATED = 2,
 	FLAG_SATURATED = 4,
+};
+
+enum admin_op {
+	ADMIN_MODULE_FILE = 1,
+	ADMIN_MODULE_DATA,
+	ADMIN_KEXEC_FILE,
+	ADMIN_KEXEC_DATA,
+	ADMIN_BPF_LOAD,
+	ADMIN_PTRACE,
+	ADMIN_TRACEME,
+	ADMIN_SETUID,
+	ADMIN_SETGID,
+	ADMIN_CAPSET,
+	ADMIN_MOUNT,
+	ADMIN_MOVE_MOUNT,
+	ADMIN_UMOUNT,
+	ADMIN_PIVOT_ROOT,
+	ADMIN_SETTIME,
+	ADMIN_SYSCTL,
+	ADMIN_NS_CREATE,
+	ADMIN_SETNS,
+	ADMIN_USERNS,
 };
 
 enum limits {
@@ -50,13 +87,16 @@ enum ring_class anchor_ring_class;
 enum rec_type anchor_rec_type;
 enum rec_flag anchor_rec_flag;
 enum limits anchor_limits;
+enum admin_op anchor_admin_op;
 
 #define PROC_RING (256 << 10)
 #define NET_RING (256 << 10)
 #define FILE_RING (64 << 10)
+#define ADMIN_RING (64 << 10)
 #define PROC_SLACK 4096
 #define NET_SLACK 2048
 #define FILE_SLACK 512
+#define ADMIN_SLACK 1024
 
 #define UDP_SEEN 4
 #define UDP_CAP 16
@@ -100,9 +140,13 @@ struct exec_rec {
 	__u32 loginuid;
 	__u32 sessionid;
 	__u32 argc;
+	__u32 tty;
+	__u32 exe_nlink;
+	__u32 exe_magic;
+	__u16 exe_mode;
 	__u16 path_len;
 	__u16 argv_len;
-	__u32 pad;
+	__u16 pad[3];
 	__u8 data[];
 };
 
@@ -154,16 +198,66 @@ struct file_repeat_rec {
 	__u64 count;
 };
 
+struct exit_rec {
+	struct rec_hdr h;
+	struct actor a;
+	__u64 start_boottime;
+	__u64 cpu_ns;
+	__u32 exit_code;
+	__u32 pad;
+};
+
+struct login_rec {
+	struct rec_hdr h;
+	struct actor a;
+	__u32 loginuid;
+	__u32 sessionid;
+};
+
+struct admin_rec {
+	struct rec_hdr h;
+	struct actor a;
+	__u64 arg[4];
+	__u32 op;
+	__u16 len0;
+	__u16 len1;
+	__u8 data[];
+};
+
+struct raw_rec {
+	struct rec_hdr h;
+	struct actor a;
+	__u32 netns;
+	__u16 family;
+	__u16 type;
+	__u32 protocol;
+	__u32 pad;
+};
+
+struct unix_rec {
+	struct rec_hdr h;
+	struct actor a;
+	__u64 ino;
+	__u32 dev;
+	__u32 pad;
+};
+
 #define EXEC_MAX (sizeof(struct exec_rec) + PATH_MAX_REC + ARGV_MAX_REC)
 #define CGROUP_MAX (sizeof(struct cgroup_rec) + CGROUP_PATH_MAX)
 #define SOCK_MAX (sizeof(struct sock_rec) + DNS_MAX)
 #define FILE_MAX (sizeof(struct file_rec) + NAME_MAX_REC)
+#define ADMIN_MAX (sizeof(struct admin_rec) + 2 * ADMIN_STR)
 
 struct exec_rec anchor_exec;
 struct cgroup_rec anchor_cgroup;
 struct sock_rec anchor_sock;
 struct file_rec anchor_file;
 struct file_repeat_rec anchor_file_repeat;
+struct exit_rec anchor_exit;
+struct login_rec anchor_login;
+struct admin_rec anchor_admin;
+struct raw_rec anchor_raw;
+struct unix_rec anchor_unix;
 
 struct ctl {
 	__u64 head;
@@ -184,6 +278,10 @@ struct ring_net_value {
 
 struct ring_file_value {
 	__u8 data[FILE_RING + FILE_SLACK];
+};
+
+struct ring_admin_value {
+	__u8 data[ADMIN_RING + ADMIN_SLACK];
 };
 
 struct {
@@ -209,6 +307,14 @@ struct {
 	__type(key, __u32);
 	__type(value, struct ring_file_value);
 } ring_file SEC(".maps");
+
+struct {
+	__uint(type, BPF_MAP_TYPE_ARRAY);
+	__uint(map_flags, BPF_F_MMAPABLE);
+	__uint(max_entries, 1);
+	__type(key, __u32);
+	__type(value, struct ring_admin_value);
+} ring_admin SEC(".maps");
 
 struct {
 	__uint(type, BPF_MAP_TYPE_ARRAY);
@@ -243,14 +349,32 @@ struct {
 	__type(value, struct file_seen);
 } file_seen SEC(".maps");
 
+struct udp_dst {
+	__u64 addr[2];
+	__u16 port;
+	__u16 pad[3];
+};
+
 struct udp_meta {
-	__u32 daddr[UDP_SEEN];
-	__u16 dport[UDP_SEEN];
+	struct udp_dst seen[UDP_SEEN];
 	__u8 next;
 	__u8 distinct;
 	__u8 dns;
 	__u8 pad[5];
 };
+
+struct inode_key {
+	__u64 ino;
+	__u32 dev;
+	__u32 pad;
+};
+
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__uint(max_entries, 64);
+	__type(key, struct inode_key);
+	__type(value, __u8);
+} unix_watch SEC(".maps");
 
 struct {
 	__uint(type, BPF_MAP_TYPE_SK_STORAGE);
@@ -278,6 +402,9 @@ __u64 file_window;
 
 extern void bpf_preempt_disable(void) __ksym;
 extern void bpf_preempt_enable(void) __ksym;
+extern void bpf_rcu_read_lock(void) __ksym;
+extern void bpf_rcu_read_unlock(void) __ksym;
+extern int bpf_path_d_path(const struct path *path, char *buf, size_t buf__sz) __ksym;
 
 struct ring_slot {
 	struct ctl *c;
@@ -318,19 +445,25 @@ static __always_inline void commit(struct ring_slot *s, struct rec_hdr *h, __u32
 
 static __always_inline void fill_actor(struct actor *a)
 {
-	struct task_struct *leader = bpf_get_current_task_btf()->group_leader;
-	struct task_meta *m = bpf_task_storage_get(&task_meta, leader, 0, 0);
 	__u64 pid_tgid = bpf_get_current_pid_tgid();
-	__u64 own_seq = leader->self_exec_id;
+	struct task_struct *leader;
+	struct task_meta *m;
+	__u64 proc, seq;
 
-	a->proc = leader->thread_pid->ino;
+	bpf_rcu_read_lock();
+	leader = bpf_get_current_task_btf()->group_leader;
+	proc = leader->thread_pid->ino;
+	seq = leader->self_exec_id;
+	m = bpf_task_storage_get(&task_meta, leader, 0, 0);
 	if (m && m->image_proc) {
 		a->image_proc = m->image_proc;
 		a->image_seq = m->image_seq;
 	} else {
-		a->image_proc = a->proc;
-		a->image_seq = own_seq;
+		a->image_proc = proc;
+		a->image_seq = seq;
 	}
+	bpf_rcu_read_unlock();
+	a->proc = proc;
 	a->cgroup = bpf_get_current_cgroup_id();
 	a->pid = pid_tgid >> 32;
 	a->tid = (__u32)pid_tgid;
@@ -370,6 +503,73 @@ static __always_inline void emit_sock(struct sock *sk, __u8 type)
 	if (r) {
 		fill_sock(r, sk);
 		commit(&s, &r->h, sizeof(*r), type, 0);
+	}
+	bpf_preempt_enable();
+}
+
+static __always_inline __u32 tty_dev(struct task_struct *task)
+{
+	struct tty_struct *tty = BPF_CORE_READ(task, signal, tty);
+
+	if (!tty)
+		return 0;
+	return (BPF_CORE_READ(tty, driver, major) << 20) |
+	       (BPF_CORE_READ(tty, driver, minor_start) + BPF_CORE_READ(tty, index));
+}
+
+static __always_inline struct admin_rec *admin_begin(struct ring_slot *s, __u32 op)
+{
+	struct admin_rec *r = reserve(&ring_admin, CLASS_ADMIN, ADMIN_RING, ADMIN_MAX, s);
+
+	if (r) {
+		fill_actor(&r->a);
+		__builtin_memset(r->arg, 0, sizeof(r->arg));
+		r->op = op;
+	}
+	return r;
+}
+
+static __always_inline void admin_commit(struct ring_slot *s, struct admin_rec *r, __u32 len0, __u32 len1)
+{
+	r->len0 = len0;
+	r->len1 = len1;
+	commit(s, &r->h, sizeof(*r) + len0 + len1, REC_ADMIN, 0);
+}
+
+static __always_inline void admin_emit(__u32 op, __u64 a0, __u64 a1, __u64 a2, __u64 a3)
+{
+	struct admin_rec *r;
+	struct ring_slot s;
+
+	bpf_preempt_disable();
+	r = admin_begin(&s, op);
+	if (r) {
+		r->arg[0] = a0;
+		r->arg[1] = a1;
+		r->arg[2] = a2;
+		r->arg[3] = a3;
+		admin_commit(&s, r, 0, 0);
+	}
+	bpf_preempt_enable();
+}
+
+static __always_inline void admin_paths(__u32 op, const struct path *p0, const struct path *p1)
+{
+	struct admin_rec *r;
+	struct ring_slot s;
+	__u32 len0 = 0, len1 = 0;
+	long n;
+
+	bpf_preempt_disable();
+	r = admin_begin(&s, op);
+	if (r) {
+		n = bpf_path_d_path(p0, (char *)r->data, ADMIN_STR);
+		if (n > 1)
+			len0 = (n - 1) & (ADMIN_STR - 1);
+		n = bpf_path_d_path(p1, (char *)r->data + len0, ADMIN_STR);
+		if (n > 1)
+			len1 = (n - 1) & (ADMIN_STR - 1);
+		admin_commit(&s, r, len0, len1);
 	}
 	bpf_preempt_enable();
 }
@@ -449,7 +649,11 @@ int BPF_PROG(on_exec, struct linux_binprm *bprm)
 		r->loginuid = task->loginuid.val;
 		r->sessionid = task->sessionid;
 		r->argc = argc;
-		r->pad = 0;
+		r->tty = tty_dev(task);
+		r->exe_nlink = inode->i_nlink;
+		r->exe_magic = inode->i_sb->s_magic;
+		r->exe_mode = inode->i_mode;
+		__builtin_memset(r->pad, 0, sizeof(r->pad));
 
 		n = bpf_d_path(&file->f_path, (char *)r->data, PATH_MAX_REC);
 		if (n > 1)
@@ -539,48 +743,35 @@ int BPF_PROG(on_listen, struct socket *sock, int backlog, int ret)
 	return 0;
 }
 
-static __always_inline bool udp_seen(struct udp_meta *m, __u32 daddr, __u16 dport)
+static __always_inline bool udp_seen(struct udp_meta *m, const __u64 *addr, __u16 port)
 {
 	for (int i = 0; i < UDP_SEEN; i++)
-		if (m->daddr[i] == daddr && m->dport[i] == dport)
+		if (m->seen[i].addr[0] == addr[0] && m->seen[i].addr[1] == addr[1] && m->seen[i].port == port)
 			return true;
 	return false;
 }
 
-SEC("fexit/udp_sendmsg")
-int BPF_PROG(on_udp_send, struct sock *sk, struct msghdr *msg, size_t len, int ret)
+static __always_inline void udp_emit(struct sock *sk, struct msghdr *msg, int ret, __u8 family, const __u64 *addr,
+				     __u16 port)
 {
-	struct sockaddr_in sin = {};
-	void *name = msg->msg_name;
-	__u32 daddr = sk->__sk_common.skc_daddr, plen = 0;
-	__u16 dport = sk->__sk_common.skc_dport;
+	bool dns = port == bpf_htons(DNS_PORT), seen;
 	struct udp_meta *m;
 	struct sock_rec *r;
 	struct ring_slot s;
 	__u8 flags = 0, slot;
-	bool dns;
+	__u32 plen = 0;
 
-	barrier_var(daddr);
-	barrier_var(dport);
-	if (ret < 0)
-		return 0;
-	if (name) {
-		bpf_probe_read_kernel(&sin, sizeof(sin), name);
-		if (sin.sin_family != AF_INET)
-			return 0;
-		daddr = sin.sin_addr.s_addr;
-		dport = sin.sin_port;
-	}
-	dns = dport == bpf_htons(DNS_PORT);
 	m = bpf_sk_storage_get(&udp_meta, sk, 0, BPF_SK_STORAGE_GET_F_CREATE);
 	if (!m)
-		return 0;
-	if (!dns && (udp_seen(m, daddr, dport) || m->distinct >= UDP_CAP))
-		return 0;
-	if (!udp_seen(m, daddr, dport)) {
+		return;
+	seen = udp_seen(m, addr, port);
+	if (!dns && (seen || m->distinct >= UDP_CAP))
+		return;
+	if (!seen) {
 		slot = m->next & (UDP_SEEN - 1);
-		m->daddr[slot] = daddr;
-		m->dport[slot] = dport;
+		m->seen[slot].addr[0] = addr[0];
+		m->seen[slot].addr[1] = addr[1];
+		m->seen[slot].port = port;
 		m->next = slot + 1;
 		m->distinct += 1;
 		if (m->distinct == UDP_CAP)
@@ -593,9 +784,13 @@ int BPF_PROG(on_udp_send, struct sock *sk, struct msghdr *msg, size_t len, int r
 	r = reserve(&ring_net, CLASS_NET, NET_RING, SOCK_MAX, &s);
 	if (r) {
 		fill_sock(r, sk);
-		__builtin_memset(r->daddr, 0, 16);
-		*(__u32 *)r->daddr = daddr;
-		r->dport = bpf_ntohs(dport);
+		r->family = family;
+		if (family == AF_INET) {
+			__builtin_memset(r->saddr, 0, 16);
+			*(__u32 *)r->saddr = sk->__sk_common.skc_rcv_saddr;
+		}
+		__builtin_memcpy(r->daddr, addr, 16);
+		r->dport = bpf_ntohs(port);
 		if (dns && msg->msg_iter.iter_type == ITER_UBUF) {
 			plen = ret;
 			if (plen > DNS_MAX)
@@ -608,6 +803,55 @@ int BPF_PROG(on_udp_send, struct sock *sk, struct msghdr *msg, size_t len, int r
 		commit(&s, &r->h, sizeof(*r) + plen, dns ? REC_DNS_QUERY : REC_UDP_SEND, flags);
 	}
 	bpf_preempt_enable();
+}
+
+SEC("fexit/udp_sendmsg")
+int BPF_PROG(on_udp_send, struct sock *sk, struct msghdr *msg, size_t len, int ret)
+{
+	struct sockaddr_in sin = {};
+	void *name = msg->msg_name;
+	__u32 daddr = sk->__sk_common.skc_daddr;
+	__u16 dport = sk->__sk_common.skc_dport;
+	__u64 addr[2] = {};
+
+	barrier_var(daddr);
+	barrier_var(dport);
+	if (ret < 0)
+		return 0;
+	if (name) {
+		bpf_probe_read_kernel(&sin, sizeof(sin), name);
+		if (sin.sin_family != AF_INET)
+			return 0;
+		daddr = sin.sin_addr.s_addr;
+		dport = sin.sin_port;
+	}
+	addr[0] = daddr;
+	udp_emit(sk, msg, ret, AF_INET, addr, dport);
+	return 0;
+}
+
+SEC("fexit/udpv6_sendmsg")
+int BPF_PROG(on_udp6_send, struct sock *sk, struct msghdr *msg, size_t len, int ret)
+{
+	struct sockaddr_in6 sin6 = {};
+	void *name = msg->msg_name;
+	__u16 dport = sk->__sk_common.skc_dport;
+	__u64 addr[2] = {};
+
+	barrier_var(dport);
+	if (ret < 0)
+		return 0;
+	bpf_probe_read_kernel(addr, sizeof(addr), &sk->__sk_common.skc_v6_daddr);
+	if (name) {
+		bpf_probe_read_kernel(&sin6, sizeof(sin6), name);
+		if (sin6.sin6_family != AF_INET6)
+			return 0;
+		__builtin_memcpy(addr, &sin6.sin6_addr, sizeof(addr));
+		dport = sin6.sin6_port;
+	}
+	if (addr[0] == 0 && (__u32)addr[1] == bpf_htonl(0xffff))
+		return 0;
+	udp_emit(sk, msg, ret, AF_INET6, addr, dport);
 	return 0;
 }
 
@@ -615,18 +859,31 @@ SEC("fentry/skb_consume_udp")
 int BPF_PROG(on_udp_consume, struct sock *sk, struct sk_buff *skb, int len)
 {
 	struct udp_meta *m = bpf_sk_storage_get(&udp_meta, sk, 0, 0);
-	unsigned char *head;
-	struct iphdr ip;
+	struct ipv6hdr ip6 = {};
+	struct iphdr ip = {};
+	unsigned char *head, *nh;
 	struct udphdr udp;
 	struct sock_rec *r;
 	struct ring_slot s;
+	__u8 version;
 	__u32 plen;
 
 	if (!m || !m->dns || len <= 0)
 		return 0;
 	head = skb->head;
-	if (bpf_probe_read_kernel(&ip, sizeof(ip), head + skb->network_header) || ip.version != 4)
+	nh = head + skb->network_header;
+	if (bpf_probe_read_kernel(&version, 1, nh))
 		return 0;
+	version >>= 4;
+	if (version == 4) {
+		if (bpf_probe_read_kernel(&ip, sizeof(ip), nh))
+			return 0;
+	} else if (version == 6) {
+		if (bpf_probe_read_kernel(&ip6, sizeof(ip6), nh))
+			return 0;
+	} else {
+		return 0;
+	}
 	if (bpf_probe_read_kernel(&udp, sizeof(udp), head + skb->transport_header))
 		return 0;
 	plen = bpf_ntohs(udp.len) - sizeof(udp);
@@ -637,8 +894,15 @@ int BPF_PROG(on_udp_consume, struct sock *sk, struct sk_buff *skb, int len)
 		fill_sock(r, sk);
 		__builtin_memset(r->saddr, 0, 16);
 		__builtin_memset(r->daddr, 0, 16);
-		*(__u32 *)r->saddr = ip.daddr;
-		*(__u32 *)r->daddr = ip.saddr;
+		if (version == 4) {
+			r->family = AF_INET;
+			*(__u32 *)r->saddr = ip.daddr;
+			*(__u32 *)r->daddr = ip.saddr;
+		} else {
+			r->family = AF_INET6;
+			__builtin_memcpy(r->saddr, &ip6.daddr, 16);
+			__builtin_memcpy(r->daddr, &ip6.saddr, 16);
+		}
 		r->sport = bpf_ntohs(udp.dest);
 		r->dport = bpf_ntohs(udp.source);
 		if (plen > DNS_MAX)
@@ -648,6 +912,75 @@ int BPF_PROG(on_udp_consume, struct sock *sk, struct sk_buff *skb, int len)
 			plen = 0;
 		r->payload_len = plen;
 		commit(&s, &r->h, sizeof(*r) + plen, REC_DNS_ANSWER, 0);
+	}
+	bpf_preempt_enable();
+	return 0;
+}
+
+static __always_inline void emit_raw(__u16 family, __u16 type, __u32 protocol, __u32 netns)
+{
+	struct raw_rec *r;
+	struct ring_slot s;
+
+	bpf_preempt_disable();
+	r = reserve(&ring_net, CLASS_NET, NET_RING, sizeof(*r), &s);
+	if (r) {
+		fill_actor(&r->a);
+		r->netns = netns;
+		r->family = family;
+		r->type = type;
+		r->protocol = protocol;
+		r->pad = 0;
+		commit(&s, &r->h, sizeof(*r), REC_RAW_SOCKET, 0);
+	}
+	bpf_preempt_enable();
+}
+
+SEC("fexit/packet_create")
+int BPF_PROG(on_packet_create, struct net *net, struct socket *sock, int protocol, int kern, int ret)
+{
+	if (!ret && !kern)
+		emit_raw(AF_PACKET, sock->type, bpf_ntohs(protocol), net->ns.inum);
+	return 0;
+}
+
+SEC("fexit/raw_sk_init")
+int BPF_PROG(on_raw_init, struct sock *sk, int ret)
+{
+	if (!ret && !BPF_CORE_READ_BITFIELD_PROBED(sk, sk_kern_sock))
+		emit_raw(AF_INET, SOCK_RAW, sk->sk_protocol, sk->__sk_common.skc_net.net->ns.inum);
+	return 0;
+}
+
+SEC("fexit/rawv6_init_sk")
+int BPF_PROG(on_raw6_init, struct sock *sk, int ret)
+{
+	if (!ret && !BPF_CORE_READ_BITFIELD_PROBED(sk, sk_kern_sock))
+		emit_raw(AF_INET6, SOCK_RAW, sk->sk_protocol, sk->__sk_common.skc_net.net->ns.inum);
+	return 0;
+}
+
+SEC("lsm/unix_stream_connect")
+int BPF_PROG(on_unix_connect, struct sock *sock, struct sock *other, struct sock *newsk)
+{
+	struct unix_sock *u = bpf_core_cast(other, struct unix_sock);
+	struct inode *inode = u->path.dentry->d_inode;
+	struct inode_key k = {};
+	struct unix_rec *r;
+	struct ring_slot s;
+
+	k.ino = inode->i_ino;
+	k.dev = inode->i_sb->s_dev;
+	if (!k.ino || !bpf_map_lookup_elem(&unix_watch, &k))
+		return 0;
+	bpf_preempt_disable();
+	r = reserve(&ring_net, CLASS_NET, NET_RING, sizeof(*r), &s);
+	if (r) {
+		fill_actor(&r->a);
+		r->ino = k.ino;
+		r->dev = k.dev;
+		r->pad = 0;
+		commit(&s, &r->h, sizeof(*r), REC_UNIX_CONNECT, 0);
 	}
 	bpf_preempt_enable();
 	return 0;
@@ -771,7 +1104,11 @@ int snapshot(struct bpf_iter__task *ctx)
 	r->loginuid = task->loginuid.val;
 	r->sessionid = task->sessionid;
 	r->argc = 0;
-	r->pad = 0;
+	r->tty = tty_dev(task);
+	r->exe_nlink = 0;
+	r->exe_magic = 0;
+	r->exe_mode = 0;
+	__builtin_memset(r->pad, 0, sizeof(r->pad));
 	r->exe_ino = 0;
 	r->exe_dev = 0;
 	r->exe_ctime = 0;
@@ -780,6 +1117,9 @@ int snapshot(struct bpf_iter__task *ctx)
 		r->exe_ino = BPF_CORE_READ(exe, f_inode, i_ino);
 		r->exe_dev = BPF_CORE_READ(exe, f_inode, i_sb, s_dev);
 		r->exe_ctime = BPF_CORE_READ(exe, f_inode, i_ctime_sec);
+		r->exe_nlink = BPF_CORE_READ(exe, f_inode, i_nlink);
+		r->exe_magic = BPF_CORE_READ(exe, f_inode, i_sb, s_magic);
+		r->exe_mode = BPF_CORE_READ(exe, f_inode, i_mode);
 	}
 	start = mm->arg_start;
 	end = mm->arg_end;
@@ -809,5 +1149,314 @@ SEC("syscall")
 int clock_now(void *ctx)
 {
 	clock_jiffies = bpf_jiffies64();
+	return 0;
+}
+
+SEC("tp_btf/sched_process_exit")
+int BPF_PROG(on_exit, struct task_struct *task, bool group_dead)
+{
+	struct signal_struct *sig = task->signal;
+	struct exit_rec *r;
+	struct ring_slot s;
+
+	if (!group_dead)
+		return 0;
+	bpf_preempt_disable();
+	r = reserve(&ring_proc, CLASS_PROC, PROC_RING, sizeof(*r), &s);
+	if (r) {
+		fill_actor(&r->a);
+		r->start_boottime = task->group_leader->start_boottime;
+		r->cpu_ns = sig->utime + sig->stime + task->utime + task->stime;
+		r->exit_code = task->exit_code;
+		r->pad = 0;
+		commit(&s, &r->h, sizeof(*r), REC_EXIT, 0);
+	}
+	bpf_preempt_enable();
+	return 0;
+}
+
+SEC("fexit/audit_set_loginuid")
+int BPF_PROG(on_login, __u32 loginuid, int ret)
+{
+	struct task_struct *task = bpf_get_current_task_btf();
+	struct login_rec *r;
+	struct ring_slot s;
+
+	if (ret)
+		return 0;
+	bpf_preempt_disable();
+	r = reserve(&ring_proc, CLASS_PROC, PROC_RING, sizeof(*r), &s);
+	if (r) {
+		fill_actor(&r->a);
+		r->loginuid = task->loginuid.val;
+		r->sessionid = task->sessionid;
+		commit(&s, &r->h, sizeof(*r), REC_LOGIN, 0);
+	}
+	bpf_preempt_enable();
+	return 0;
+}
+
+SEC("lsm.s/kernel_read_file")
+int BPF_PROG(on_kernel_read_file, struct file *file, enum kernel_read_file_id id, bool contents)
+{
+	struct admin_rec *r;
+	struct ring_slot s;
+	__u32 op, len = 0;
+	long n;
+
+	if (id == READING_MODULE || id == READING_MODULE_COMPRESSED)
+		op = ADMIN_MODULE_FILE;
+	else if (id == READING_KEXEC_IMAGE || id == READING_KEXEC_INITRAMFS)
+		op = ADMIN_KEXEC_FILE;
+	else
+		return 0;
+	bpf_preempt_disable();
+	r = admin_begin(&s, op);
+	if (r) {
+		r->arg[0] = file->f_inode->i_sb->s_dev;
+		r->arg[1] = file->f_inode->i_ino;
+		n = bpf_d_path(&file->f_path, (char *)r->data, ADMIN_STR);
+		if (n > 1)
+			len = (n - 1) & (ADMIN_STR - 1);
+		admin_commit(&s, r, len, 0);
+	}
+	bpf_preempt_enable();
+	return 0;
+}
+
+SEC("lsm/kernel_load_data")
+int BPF_PROG(on_kernel_load_data, enum kernel_load_data_id id, bool contents)
+{
+	if (id == LOADING_MODULE || id == LOADING_MODULE_COMPRESSED)
+		admin_emit(ADMIN_MODULE_DATA, 0, 0, 0, 0);
+	else if (id == LOADING_KEXEC_IMAGE || id == LOADING_KEXEC_INITRAMFS)
+		admin_emit(ADMIN_KEXEC_DATA, 0, 0, 0, 0);
+	return 0;
+}
+
+SEC("lsm/bpf_prog_load")
+int BPF_PROG(on_bpf_prog_load, struct bpf_prog *prog, union bpf_attr *attr, struct bpf_token *token, bool kernel)
+{
+	struct admin_rec *r;
+	struct ring_slot s;
+	__u32 len = 0;
+	long n;
+
+	if (kernel)
+		return 0;
+	bpf_preempt_disable();
+	r = admin_begin(&s, ADMIN_BPF_LOAD);
+	if (r) {
+		r->arg[0] = prog->type;
+		r->arg[1] = prog->expected_attach_type;
+		r->arg[2] = prog->len;
+		r->arg[3] = prog->aux->attach_btf_id;
+		n = bpf_probe_read_kernel_str(r->data, BPF_NAME, prog->aux->name);
+		if (n > 1)
+			len = (n - 1) & (BPF_NAME - 1);
+		admin_commit(&s, r, len, 0);
+	}
+	bpf_preempt_enable();
+	return 0;
+}
+
+SEC("lsm/ptrace_access_check")
+int BPF_PROG(on_ptrace_access, struct task_struct *child, unsigned int mode)
+{
+	if (mode & PTRACE_MODE_ATTACH)
+		admin_emit(ADMIN_PTRACE, child->group_leader->thread_pid->ino, child->tgid, mode, 0);
+	return 0;
+}
+
+SEC("lsm/ptrace_traceme")
+int BPF_PROG(on_ptrace_traceme, struct task_struct *parent)
+{
+	admin_emit(ADMIN_TRACEME, parent->group_leader->thread_pid->ino, parent->tgid, 0, 0);
+	return 0;
+}
+
+static __always_inline bool gains_root(__u32 old, __u32 new)
+{
+	return old != 0 && new == 0;
+}
+
+SEC("lsm/task_fix_setuid")
+int BPF_PROG(on_setuid, struct cred *new, const struct cred *old, int flags)
+{
+	__u32 ou = old->uid.val, oe = old->euid.val, os = old->suid.val, of = old->fsuid.val;
+	__u32 nu = new->uid.val, ne = new->euid.val, ns = new->suid.val, nf = new->fsuid.val;
+
+	if (nu != ou || gains_root(oe, ne) || gains_root(os, ns) || gains_root(of, nf))
+		admin_emit(ADMIN_SETUID, ou | (__u64)oe << 32, nu | (__u64)ne << 32, os | (__u64)of << 32,
+			   ns | (__u64)nf << 32);
+	return 0;
+}
+
+SEC("lsm/task_fix_setgid")
+int BPF_PROG(on_setgid, struct cred *new, const struct cred *old, int flags)
+{
+	__u32 og = old->gid.val, oe = old->egid.val, os = old->sgid.val, of = old->fsgid.val;
+	__u32 ng = new->gid.val, ne = new->egid.val, ns = new->sgid.val, nf = new->fsgid.val;
+
+	if (ng != og || gains_root(oe, ne) || gains_root(os, ns) || gains_root(of, nf))
+		admin_emit(ADMIN_SETGID, og | (__u64)oe << 32, ng | (__u64)ne << 32, os | (__u64)of << 32,
+			   ns | (__u64)nf << 32);
+	return 0;
+}
+
+SEC("lsm/capset")
+int BPF_PROG(on_capset, struct cred *new, const struct cred *old, const kernel_cap_t *effective,
+	     const kernel_cap_t *inheritable, const kernel_cap_t *permitted)
+{
+	__u64 oe = old->cap_effective.val, ne = effective->val, np = permitted->val, ni = inheritable->val;
+
+	if (oe != ne || old->cap_permitted.val != np || old->cap_inheritable.val != ni)
+		admin_emit(ADMIN_CAPSET, oe, ne, np, ni);
+	return 0;
+}
+
+SEC("lsm.s/sb_mount")
+int BPF_PROG(on_mount, const char *dev_name, const struct path *path, const char *type, unsigned long flags,
+	     void *data)
+{
+	struct admin_rec *r;
+	struct ring_slot s;
+	__u32 len0 = 0, len1 = 0;
+	long n;
+
+	bpf_preempt_disable();
+	r = admin_begin(&s, ADMIN_MOUNT);
+	if (r) {
+		r->arg[0] = flags;
+		if (type)
+			bpf_probe_read_kernel_str(&r->arg[1], 2 * sizeof(r->arg[1]), type);
+		n = bpf_d_path((struct path *)path, (char *)r->data, ADMIN_STR);
+		if (n > 1)
+			len0 = (n - 1) & (ADMIN_STR - 1);
+		if (dev_name) {
+			n = bpf_probe_read_kernel_str(r->data + len0, ADMIN_STR, dev_name);
+			if (n > 1)
+				len1 = (n - 1) & (ADMIN_STR - 1);
+		}
+		admin_commit(&s, r, len0, len1);
+	}
+	bpf_preempt_enable();
+	return 0;
+}
+
+SEC("lsm/move_mount")
+int BPF_PROG(on_move_mount, const struct path *from_path, const struct path *to_path)
+{
+	admin_paths(ADMIN_MOVE_MOUNT, to_path, from_path);
+	return 0;
+}
+
+SEC("lsm/sb_pivotroot")
+int BPF_PROG(on_pivot_root, const struct path *old_path, const struct path *new_path)
+{
+	admin_paths(ADMIN_PIVOT_ROOT, new_path, old_path);
+	return 0;
+}
+
+SEC("lsm/sb_umount")
+int BPF_PROG(on_umount, struct vfsmount *mnt, int flags)
+{
+	struct admin_rec *r;
+	struct ring_slot s;
+	__u32 len = 0;
+	long n;
+
+	bpf_preempt_disable();
+	r = admin_begin(&s, ADMIN_UMOUNT);
+	if (r) {
+		r->arg[0] = flags;
+		r->arg[1] = mnt->mnt_sb->s_dev;
+		n = bpf_probe_read_kernel_str(r->data, ADMIN_STR, mnt->mnt_sb->s_type->name);
+		if (n > 1)
+			len = (n - 1) & (ADMIN_STR - 1);
+		admin_commit(&s, r, len, 0);
+	}
+	bpf_preempt_enable();
+	return 0;
+}
+
+SEC("lsm/settime")
+int BPF_PROG(on_settime, const struct timespec64 *ts, const struct timezone *tz)
+{
+	if (ts)
+		admin_emit(ADMIN_SETTIME, ts->tv_sec, ts->tv_nsec, 0, 0);
+	return 0;
+}
+
+SEC("fentry/proc_sys_write")
+int BPF_PROG(on_sysctl_write, struct kiocb *iocb, struct iov_iter *iter)
+{
+	struct dentry *d = iocb->ki_filp->f_path.dentry;
+	struct admin_rec *r;
+	struct ring_slot s;
+	__u32 pos = 0, vlen = 0;
+	long n;
+
+	bpf_preempt_disable();
+	r = admin_begin(&s, ADMIN_SYSCTL);
+	if (r) {
+		for (int i = 0; i < SYSCTL_DEPTH; i++) {
+			struct dentry *parent = d->d_parent;
+
+			if (parent == d || pos >= ADMIN_STR - SYSCTL_NAME)
+				break;
+			n = bpf_probe_read_kernel_str(r->data + (pos & (ADMIN_STR - 1)), SYSCTL_NAME, d->d_name.name);
+			if (n <= 0)
+				break;
+			pos += n;
+			d = parent;
+		}
+		pos &= ADMIN_STR - 1;
+		if (iter->iter_type == ITER_UBUF) {
+			vlen = iter->count;
+			if (vlen > SYSCTL_VALUE)
+				vlen = SYSCTL_VALUE;
+			barrier_var(vlen);
+			if (bpf_probe_read_user(r->data + pos, vlen, iter->ubuf))
+				vlen = 0;
+		}
+		admin_commit(&s, r, pos, vlen);
+	}
+	bpf_preempt_enable();
+	return 0;
+}
+
+SEC("fexit/create_new_namespaces")
+int BPF_PROG(on_ns_create, __u64 flags, struct task_struct *tsk, struct user_namespace *user_ns,
+	     struct fs_struct *new_fs, struct nsproxy *ret)
+{
+	if ((flags & NS_FLAGS) && !IS_ERR_PTR(ret))
+		admin_emit(ADMIN_NS_CREATE, flags & NS_FLAGS, tsk != bpf_get_current_task_btf(), ret->net_ns->ns.inum,
+			   ret->mnt_ns->ns.inum);
+	return 0;
+}
+
+#define NS_INSTALL(fn, flag)                                                         \
+	SEC("fexit/" #fn)                                                            \
+	int BPF_PROG(on_##fn, struct nsset *nsset, struct ns_common *ns, int ret)    \
+	{                                                                            \
+		if (!ret)                                                            \
+			admin_emit(ADMIN_SETNS, flag, ns->inum, 0, 0);               \
+		return 0;                                                            \
+	}
+
+NS_INSTALL(cgroupns_install, 0x02000000)
+NS_INSTALL(ipcns_install, 0x08000000)
+NS_INSTALL(mntns_install, 0x00020000)
+NS_INSTALL(netns_install, 0x40000000)
+NS_INSTALL(pidns_install, 0x20000000)
+NS_INSTALL(timens_install, 0x00000080)
+NS_INSTALL(userns_install, 0x10000000)
+NS_INSTALL(utsns_install, 0x04000000)
+
+SEC("lsm/userns_create")
+int BPF_PROG(on_userns_create, const struct cred *cred)
+{
+	admin_emit(ADMIN_USERNS, cred->euid.val, 0, 0, 0);
 	return 0;
 }

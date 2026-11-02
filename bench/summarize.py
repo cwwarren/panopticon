@@ -87,8 +87,9 @@ def annotate_pano(r, log):
     delta = pano_window(pano_series(log), r["t0"], r["t1"])
     if delta is None:
         return
-    proc, net, file, drops, coalesced = delta
-    r["drop_pct"] = 100 * drops / (proc + net + file + drops) if proc + net + file + drops else 0.0
+    proc, net, file, admin, drops, coalesced = delta
+    total = proc + net + file + admin + drops
+    r["drop_pct"] = 100 * drops / total if total else 0.0
     name, ops = r["name"], r.get("ops")
     if name.startswith("exec"):
         r["delivered_pct"] = 100 * proc / ops

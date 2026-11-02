@@ -17,6 +17,11 @@ const DNS_QUERY: u32 = types::rec_type::REC_DNS_QUERY.0;
 const DNS_ANSWER: u32 = types::rec_type::REC_DNS_ANSWER.0;
 const FILE: u32 = types::rec_type::REC_FILE.0;
 const FILE_REPEAT: u32 = types::rec_type::REC_FILE_REPEAT.0;
+const EXIT: u32 = types::rec_type::REC_EXIT.0;
+const LOGIN: u32 = types::rec_type::REC_LOGIN.0;
+const ADMIN: u32 = types::rec_type::REC_ADMIN.0;
+const RAW_SOCKET: u32 = types::rec_type::REC_RAW_SOCKET.0;
+const UNIX_CONNECT: u32 = types::rec_type::REC_UNIX_CONNECT.0;
 const META: u32 = wire::REC_META as u32;
 const CLOCK: u32 = wire::REC_CLOCK as u32;
 const LOSS: u32 = wire::REC_LOSS as u32;
@@ -82,6 +87,7 @@ fn records(data: &[u8]) -> impl Iterator<Item = (&[u8], types::rec_hdr)> {
 #[derive(Default)]
 struct Decoder {
     clocks: Vec<(u64, u64)>,
+    boot_to_real_ms: i128,
     hz: u64,
     images: HashMap<(u64, u64), String>,
     watches: HashMap<(u32, u64), String>,
@@ -139,6 +145,55 @@ fn dev(d: u32) -> String {
     format!("{}:{}", d >> 20, d & 0xfffff)
 }
 
+const FS_MAGIC: [(u32, &str); 12] = [
+    (0x0102_1994, "tmpfs"),
+    (0x8584_58f6, "ramfs"),
+    (0x9584_58f6, "hugetlbfs"),
+    (0x794c_7630, "overlay"),
+    (0xef53, "ext4"),
+    (0x9123_683e, "btrfs"),
+    (0x5846_5342, "xfs"),
+    (0x7371_7368, "squashfs"),
+    (0x6969, "nfs"),
+    (0x6573_5546, "fuse"),
+    (0x2fc1_2fc1, "zfs"),
+    (0x0102_1997, "9p"),
+];
+
+fn fs_name(magic: u32) -> String {
+    match FS_MAGIC.iter().find(|(m, _)| *m == magic) {
+        Some((_, name)) => (*name).to_string(),
+        None => format!("{magic:#x}"),
+    }
+}
+
+fn fstype(a: u64, b: u64) -> String {
+    let mut bytes = [0u8; 16];
+    bytes[..8].copy_from_slice(&a.to_ne_bytes());
+    bytes[8..].copy_from_slice(&b.to_ne_bytes());
+    text(&bytes[..bytes.iter().position(|&c| c == 0).unwrap_or(16)])
+}
+
+const NAMESPACES: [(u64, &str); 8] = [
+    (0x80, "time"),
+    (0x2_0000, "mnt"),
+    (0x0200_0000, "cgroup"),
+    (0x0400_0000, "uts"),
+    (0x0800_0000, "ipc"),
+    (0x1000_0000, "user"),
+    (0x2000_0000, "pid"),
+    (0x4000_0000, "net"),
+];
+
+fn ns_names(flags: u64) -> String {
+    let names: Vec<String> = NAMESPACES
+        .iter()
+        .filter(|(bit, _)| flags & bit != 0)
+        .map(|(_, n)| quote(n))
+        .collect();
+    format!("[{}]", names.join(","))
+}
+
 fn addr(family: u8, raw: &[u8; 16], port: u16) -> String {
     if family == 10 {
         format!("[{}]:{port}", Ipv6Addr::from(*raw))
@@ -151,9 +206,14 @@ impl Decoder {
     fn index(&mut self, rec: &[u8], h: &types::rec_hdr) {
         match u32::from(h.r#type) {
             CLOCK => {
-                let (jiffies, realtime): (u64, u64) =
-                    (read(&rec[wire::HDR..]), read(&rec[wire::HDR + 8..]));
+                let (jiffies, realtime, boottime): (u64, u64, u64) = (
+                    read(&rec[wire::HDR..]),
+                    read(&rec[wire::HDR + 8..]),
+                    read(&rec[wire::HDR + 16..]),
+                );
                 self.clocks.push((jiffies, realtime / 1_000_000));
+                self.boot_to_real_ms =
+                    i128::from(realtime / 1_000_000) - i128::from(boottime / 1_000_000);
             }
             META => self.hz = u64::from(read::<u32>(&rec[wire::HDR + 4..])),
             WATCH => {
@@ -296,6 +356,55 @@ impl Decoder {
                 };
                 self.file(obj, &r.k)
             }
+            EXIT => {
+                let r: types::exit_rec = read(rec);
+                let code = r.exit_code;
+                let obj = self
+                    .actor(Obj::new("exit", ts), &r.a)
+                    .num(
+                        "start",
+                        i128::from(r.start_boottime / 1_000_000) + self.boot_to_real_ms,
+                    )
+                    .num("cpu_ms", r.cpu_ns / 1_000_000);
+                if code & 0x7f != 0 {
+                    obj.num("signal", code & 0x7f).num("core", code & 0x80 != 0)
+                } else {
+                    obj.num("status", (code >> 8) & 0xff)
+                }
+            }
+            LOGIN => {
+                let r: types::login_rec = read(rec);
+                self.actor(Obj::new("login", ts), &r.a)
+                    .num("loginuid", r.loginuid)
+                    .num("sessionid", r.sessionid)
+            }
+            ADMIN => self.admin(rec, ts),
+            RAW_SOCKET => {
+                let r: types::raw_rec = read(rec);
+                let family = match r.family {
+                    2 => "inet",
+                    10 => "inet6",
+                    17 => "packet",
+                    _ => "other",
+                };
+                self.actor(Obj::new("raw_socket", ts), &r.a)
+                    .str("family", family)
+                    .num("sock_type", r.r#type)
+                    .str("protocol", &format!("{:#x}", r.protocol))
+                    .num("netns", r.netns)
+            }
+            UNIX_CONNECT => {
+                let r: types::unix_rec = read(rec);
+                let path = self
+                    .watches
+                    .get(&(r.dev, r.ino))
+                    .cloned()
+                    .unwrap_or_default();
+                self.actor(Obj::new("unix_connect", ts), &r.a)
+                    .str("path", &path)
+                    .str("dev", &dev(r.dev))
+                    .num("ino", r.ino)
+            }
             other => panic!("unknown record type {other}"),
         };
         Some(line.done())
@@ -350,10 +459,127 @@ impl Decoder {
             .str("exe_dev", &dev(r.exe_dev))
             .num("exe_ino", r.exe_ino)
             .num("exe_ctime", r.exe_ctime)
+            .str("exe_mode", &format!("{:o}", r.exe_mode))
+            .num("exe_nlink", r.exe_nlink)
+            .str("exe_fs", &fs_name(r.exe_magic))
+            .str(
+                "tty",
+                &if r.tty == 0 {
+                    String::new()
+                } else {
+                    dev(r.tty)
+                },
+            )
             .num(
                 "truncated",
                 u32::from(h.flags) & types::rec_flag::FLAG_TRUNCATED.0 != 0,
             )
+    }
+
+    fn admin(&self, rec: &[u8], ts: u64) -> Obj {
+        use types::admin_op as op;
+        let r: types::admin_rec = read(rec);
+        let body = &rec[size_of::<types::admin_rec>()..];
+        let (l0, l1) = (usize::from(r.len0), usize::from(r.len1));
+        let (s0, s1) = (text(&body[..l0]), text(&body[l0..l0 + l1]));
+        let [a0, a1, a2, a3] = r.arg;
+        let ids = |lo: u64, hi: u64| {
+            format!(
+                "[{},{},{},{}]",
+                lo & 0xffff_ffff,
+                lo >> 32,
+                hi & 0xffff_ffff,
+                hi >> 32
+            )
+        };
+        let obj = self.actor(Obj::new("admin", ts), &r.a);
+        match op(r.op) {
+            op::ADMIN_MODULE_FILE => obj
+                .str("op", "module_load")
+                .str("path", &s0)
+                .str("dev", &dev(a0 as u32))
+                .num("ino", a1),
+            op::ADMIN_MODULE_DATA => obj.str("op", "module_load_memory"),
+            op::ADMIN_KEXEC_FILE => obj
+                .str("op", "kexec_load")
+                .str("path", &s0)
+                .str("dev", &dev(a0 as u32))
+                .num("ino", a1),
+            op::ADMIN_KEXEC_DATA => obj.str("op", "kexec_load_memory"),
+            op::ADMIN_BPF_LOAD => obj
+                .str("op", "bpf_load")
+                .str("name", &s0)
+                .num("prog_type", a0)
+                .num("attach_type", a1)
+                .num("insns", a2)
+                .num("attach_btf_id", a3),
+            op::ADMIN_PTRACE => obj
+                .str("op", "ptrace")
+                .num("target_proc", a0)
+                .num("target_pid", a1)
+                .str("mode", &format!("{a2:#x}")),
+            op::ADMIN_TRACEME => obj
+                .str("op", "ptrace_traceme")
+                .num("tracer_proc", a0)
+                .num("tracer_pid", a1),
+            op::ADMIN_SETUID => obj
+                .str("op", "setuid")
+                .raw("old", &ids(a0, a2))
+                .raw("new", &ids(a1, a3)),
+            op::ADMIN_SETGID => obj
+                .str("op", "setgid")
+                .raw("old", &ids(a0, a2))
+                .raw("new", &ids(a1, a3)),
+            op::ADMIN_CAPSET => obj
+                .str("op", "capset")
+                .str("old_effective", &format!("{a0:#x}"))
+                .str("effective", &format!("{a1:#x}"))
+                .str("permitted", &format!("{a2:#x}"))
+                .str("inheritable", &format!("{a3:#x}")),
+            op::ADMIN_MOUNT => obj
+                .str("op", "mount")
+                .str("target", &s0)
+                .str("source", &s1)
+                .str("fstype", &fstype(a1, a2))
+                .str("flags", &format!("{a0:#x}")),
+            op::ADMIN_MOVE_MOUNT => obj
+                .str("op", "move_mount")
+                .str("target", &s0)
+                .str("source", &s1),
+            op::ADMIN_UMOUNT => obj
+                .str("op", "umount")
+                .str("fstype", &s0)
+                .str("dev", &dev(a1 as u32))
+                .str("flags", &format!("{a0:#x}")),
+            op::ADMIN_PIVOT_ROOT => obj
+                .str("op", "pivot_root")
+                .str("new_root", &s0)
+                .str("put_old", &s1),
+            op::ADMIN_SETTIME => obj
+                .str("op", "settime")
+                .num("sec", a0 as i64)
+                .num("nsec", a1),
+            op::ADMIN_SYSCTL => {
+                let mut parts: Vec<&str> = s0.split('\0').filter(|p| !p.is_empty()).collect();
+                parts.reverse();
+                let name = parts.join("/");
+                obj.str("op", "sysctl_write")
+                    .str("name", name.strip_prefix("sys/").unwrap_or(&name))
+                    .str("value", s1.trim_end_matches(['\n', '\0']))
+            }
+            op::ADMIN_NS_CREATE => obj
+                .str("op", "ns_create")
+                .raw("ns", &ns_names(a0))
+                .num("for_child", a1 != 0)
+                .num("netns", a2)
+                .num("mntns", a3),
+            op::ADMIN_SETNS => obj
+                .str("op", "setns")
+                .raw("ns", &ns_names(a0))
+                .num("target_ns", a1),
+            op::ADMIN_USERNS => obj.str("op", "userns_create").num("euid", a0),
+            other => panic!("unknown admin op {}", other.0),
+        }
     }
 
     fn sock(&self, rec: &[u8], h: &types::rec_hdr, ts: u64) -> Obj {

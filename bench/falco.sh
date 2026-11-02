@@ -187,11 +187,12 @@ probe_container() {
 }
 
 coverage() {
-  for pass in capability default-rules; do
+  for pass in ${COVERAGE_PASSES:-capability default-rules pano}; do
     local tag=coverage-$pass
     case $pass in
       capability) start_falco "$tag" -r "$RULES/coverage_rules.yaml" -o base_syscalls.all=true ;;
       default-rules) start_falco "$tag" ;;
+      pano) start_pano "$tag" ;;
     esac
     for action in "${ACTIONS[@]}"; do
       local t0 result

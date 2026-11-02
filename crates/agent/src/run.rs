@@ -13,33 +13,76 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use libbpf_rs::skel::{OpenSkel, Skel, SkelBuilder};
-use libbpf_rs::{Iter, Link, MapCore, ProgramInput};
+use libbpf_rs::{Iter, Link, MapCore, MapFlags, ProgramInput};
 
 use crate::bpf::{AgentSkel, AgentSkelBuilder, types};
 use crate::wire;
 
 static STOP: AtomicBool = AtomicBool::new(false);
 
-const SECRET: u32 = libc::IN_OPEN
-    | libc::IN_CLOSE_WRITE
+const READ: u32 = libc::IN_OPEN;
+const CHANGE: u32 = libc::IN_CLOSE_WRITE
+    | libc::IN_MODIFY
     | libc::IN_ATTRIB
+    | libc::IN_CREATE
+    | libc::IN_DELETE
+    | libc::IN_MOVED_FROM
+    | libc::IN_MOVED_TO
     | libc::IN_MOVE_SELF
     | libc::IN_DELETE_SELF;
-const SECRET_DIR: u32 =
-    SECRET | libc::IN_CREATE | libc::IN_DELETE | libc::IN_MOVED_FROM | libc::IN_MOVED_TO;
-const INTEGRITY: u32 =
-    libc::IN_CLOSE_WRITE | libc::IN_ATTRIB | libc::IN_MOVE_SELF | libc::IN_DELETE_SELF;
 const WATCHES: &[(&str, u32)] = &[
-    ("/etc/shadow", SECRET),
-    ("/etc/gshadow", SECRET),
-    ("/etc/sudoers", SECRET),
-    ("/etc/sudoers.d", SECRET_DIR),
-    ("/root/.ssh", SECRET_DIR),
-    ("/etc/passwd", INTEGRITY),
-    ("/etc/group", INTEGRITY),
-    ("/etc/ld.so.preload", INTEGRITY),
+    ("/etc/shadow", READ),
+    ("/etc/gshadow", READ),
+    ("/etc/security/opasswd", READ),
+    ("/etc", CHANGE),
+    ("/etc/security", CHANGE),
+    ("/etc/sudoers.d", CHANGE),
+    ("/etc/pam.d", CHANGE),
+    ("/etc/ssh", CHANGE),
+    ("/etc/ssh/sshd_config.d", CHANGE),
+    ("/etc/cron.d", CHANGE),
+    ("/etc/cron.hourly", CHANGE),
+    ("/etc/cron.daily", CHANGE),
+    ("/etc/cron.weekly", CHANGE),
+    ("/etc/cron.monthly", CHANGE),
+    ("/var/spool/cron", CHANGE),
+    ("/var/spool/cron/crontabs", CHANGE),
+    ("/var/spool/cron/atjobs", CHANGE),
+    ("/etc/systemd/user", CHANGE),
+    ("/usr/lib/systemd/system", CHANGE),
+    ("/usr/lib/systemd/user", CHANGE),
+    ("/etc/init.d", CHANGE),
+    ("/etc/profile.d", CHANGE),
+    ("/etc/ld.so.conf.d", CHANGE),
+    ("/etc/udev/rules.d", CHANGE),
+    ("/etc/modprobe.d", CHANGE),
+    ("/etc/modules-load.d", CHANGE),
+    ("/etc/update-motd.d", CHANGE),
+    ("/etc/apt/apt.conf.d", CHANGE),
+    ("/etc/xdg/autostart", CHANGE),
+    ("/boot", CHANGE),
+    ("/usr/bin", CHANGE),
+    ("/usr/sbin", CHANGE),
+    ("/usr/local/bin", CHANGE),
+    ("/usr/local/sbin", CHANGE),
 ];
-const CLASSES: [&str; 3] = ["proc", "net", "file"];
+const HOME_SECRETS: &[&str] = &[
+    ".ssh",
+    ".aws",
+    ".kube",
+    ".docker",
+    ".config/gcloud",
+    ".gnupg",
+];
+const HOME_CHANGE: &[&str] = &["", ".config/autostart", ".config/systemd/user"];
+const SOCKETS: &[&str] = &[
+    "/run/docker.sock",
+    "/run/containerd/containerd.sock",
+    "/run/k3s/containerd/containerd.sock",
+    "/run/crio/crio.sock",
+    "/run/podman/podman.sock",
+];
+const CLASSES: [&str; 4] = ["proc", "net", "file", "admin"];
 
 struct Ring {
     class: usize,
@@ -101,6 +144,7 @@ pub fn run(out_path: &str, poll: Duration) {
         &mut open.maps.ring_proc,
         &mut open.maps.ring_net,
         &mut open.maps.ring_file,
+        &mut open.maps.ring_admin,
     ] {
         map.set_max_entries(u32::try_from(ncpus).unwrap()).unwrap();
     }
@@ -127,6 +171,7 @@ pub fn run(out_path: &str, poll: Duration) {
     let mut jiffies = push_clock(&skel, &mut buf);
     push_meta(&mut buf, jiffies, ncpus, hz);
     let inotify = watch(&mut buf, jiffies);
+    watch_sockets(&skel, &mut buf, jiffies);
     push_cgroups(&mut buf, jiffies, Path::new("/sys/fs/cgroup"), "");
     push_snapshot(&skel, &mut buf);
     out.write_all(&buf).unwrap();
@@ -172,6 +217,7 @@ fn map_rings(skel: &AgentSkel, ncpus: usize, nclasses: usize) -> Vec<Ring> {
         (types::ring_class::CLASS_PROC, &skel.maps.ring_proc),
         (types::ring_class::CLASS_NET, &skel.maps.ring_net),
         (types::ring_class::CLASS_FILE, &skel.maps.ring_file),
+        (types::ring_class::CLASS_ADMIN, &skel.maps.ring_admin),
     ];
     let mut rings = Vec::new();
     for (class, map) in classes {
@@ -240,11 +286,25 @@ fn push_clock(skel: &AgentSkel, buf: &mut Vec<u8>) -> u64 {
             .as_nanos(),
     )
     .unwrap();
+    let mut ts = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    assert_eq!(
+        unsafe { libc::clock_gettime(libc::CLOCK_BOOTTIME, &mut ts) },
+        0
+    );
+    let boottime =
+        u64::try_from(ts.tv_sec).unwrap() * 1_000_000_000 + u64::try_from(ts.tv_nsec).unwrap();
     wire::push(
         buf,
         wire::REC_CLOCK,
         jiffies,
-        &[&jiffies.to_ne_bytes(), &realtime.to_ne_bytes()],
+        &[
+            &jiffies.to_ne_bytes(),
+            &realtime.to_ne_bytes(),
+            &boottime.to_ne_bytes(),
+        ],
     );
     jiffies
 }
@@ -277,16 +337,33 @@ fn entries(dir: &str) -> Vec<PathBuf> {
     }
 }
 
+fn subdirs(dir: &str) -> Vec<PathBuf> {
+    entries(dir).into_iter().filter(|p| p.is_dir()).collect()
+}
+
 fn watch_list() -> Vec<(PathBuf, u32)> {
     let mut list: Vec<(PathBuf, u32)> = WATCHES
         .iter()
         .map(|&(p, m)| (PathBuf::from(p), m))
         .collect();
+    let mut homes = subdirs("/home");
+    homes.push(PathBuf::from("/root"));
+    for home in homes {
+        list.extend(HOME_SECRETS.iter().map(|d| (home.join(d), READ | CHANGE)));
+        list.extend(HOME_CHANGE.iter().map(|d| (home.join(d), CHANGE)));
+    }
+    list.push((PathBuf::from("/etc/systemd/system"), CHANGE));
     list.extend(
-        entries("/home")
+        subdirs("/etc/systemd/system")
             .into_iter()
-            .map(|home| (home.join(".ssh"), SECRET_DIR)),
+            .map(|d| (d, CHANGE)),
     );
+    for lib in subdirs("/usr/lib") {
+        if lib.to_string_lossy().ends_with("-linux-gnu") {
+            list.push((lib.join("security"), CHANGE));
+            list.push((lib, CHANGE));
+        }
+    }
     list.extend(
         entries("/etc/ssh")
             .into_iter()
@@ -294,7 +371,7 @@ fn watch_list() -> Vec<(PathBuf, u32)> {
                 let name = p.file_name().unwrap().to_string_lossy();
                 name.starts_with("ssh_host_") && name.ends_with("_key")
             })
-            .map(|p| (p, SECRET)),
+            .map(|p| (p, READ)),
     );
     list
 }
@@ -304,7 +381,7 @@ fn watch(buf: &mut Vec<u8>, jiffies: u64) -> RawFd {
     assert!(fd >= 0, "inotify_init1: {}", io::Error::last_os_error());
     for (path, mask) in watch_list() {
         let cpath = CString::new(path.as_os_str().as_bytes()).unwrap();
-        if unsafe { libc::inotify_add_watch(fd, cpath.as_ptr(), mask) } < 0 {
+        if unsafe { libc::inotify_add_watch(fd, cpath.as_ptr(), mask | libc::IN_MASK_ADD) } < 0 {
             let err = io::Error::last_os_error();
             assert_eq!(
                 err.raw_os_error(),
@@ -327,6 +404,33 @@ fn watch(buf: &mut Vec<u8>, jiffies: u64) -> RawFd {
         );
     }
     fd
+}
+
+fn watch_sockets(skel: &AgentSkel, buf: &mut Vec<u8>, jiffies: u64) {
+    for path in SOCKETS {
+        let meta = match fs::metadata(path) {
+            Ok(meta) => meta,
+            Err(err) if err.kind() == io::ErrorKind::NotFound => continue,
+            Err(err) => panic!("stat {path}: {err}"),
+        };
+        let dev = wire::kernel_dev(meta.dev()).to_ne_bytes();
+        let key = [&meta.ino().to_ne_bytes()[..], &dev, &[0u8; 4]].concat();
+        skel.maps
+            .unix_watch
+            .update(&key, &[1], MapFlags::ANY)
+            .unwrap();
+        wire::push(
+            buf,
+            wire::REC_WATCH,
+            jiffies,
+            &[
+                &dev,
+                &0u32.to_ne_bytes(),
+                &meta.ino().to_ne_bytes(),
+                path.as_bytes(),
+            ],
+        );
+    }
 }
 
 fn push_snapshot(skel: &AgentSkel, buf: &mut Vec<u8>) {
