@@ -43,8 +43,10 @@ impl Hasher {
         thread::spawn(move || {
             idle();
             for job in queue {
-                if let Some(rec) = hash(&job) {
-                    results.send(rec).unwrap();
+                if let Some(rec) = hash(&job)
+                    && results.send(rec).is_err()
+                {
+                    return;
                 }
             }
         });

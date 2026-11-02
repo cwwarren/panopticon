@@ -174,7 +174,7 @@ fn main() {
             });
             unsafe { libbpf_sys::perf_buffer__free(pb) };
         }
-        "spsc_out" | "spsc_nots" => {
+        "spsc_out" | "spsc_nots" | "spsc_busy" => {
             let ctl = mmap(skel.maps.spsc_ctl.as_fd().as_raw_fd(), MAX_CPUS * CTL_SIZE);
             let data = mmap(
                 skel.maps.spsc_data.as_fd().as_raw_fd(),

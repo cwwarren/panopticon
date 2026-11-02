@@ -18,7 +18,9 @@ struct event {
 
 struct ctl {
 	__u64 head;
-	__u64 pad0[7];
+	__u32 busy;
+	__u32 pad_busy;
+	__u64 pad0[6];
 	__u64 tail;
 	__u64 pad1[7];
 	__u64 drops;
@@ -232,7 +234,7 @@ int BPF_PROG(perf_out)
 	return 0;
 }
 
-static __always_inline int spsc_emit(bool with_ts)
+static __always_inline int spsc_emit(bool with_ts, bool busy)
 {
 	__u32 cpu = bpf_get_smp_processor_id();
 	struct ctl *c = bpf_map_lookup_elem(&spsc_ctl, &cpu);
@@ -243,22 +245,28 @@ static __always_inline int spsc_emit(bool with_ts)
 	if (!c)
 		return 0;
 	bpf_preempt_disable();
+	if (busy && __sync_lock_test_and_set(&c->busy, 1)) {
+		__sync_fetch_and_add(&c->drops, 1);
+		bpf_preempt_enable();
+		return 0;
+	}
 	head = c->head;
 	tail = __atomic_load_n(&c->tail, __ATOMIC_ACQUIRE);
 	if (head - tail >= SPSC_SLOTS) {
 		c->drops += 1;
-		bpf_preempt_enable();
-		return 0;
+	} else {
+		idx = cpu * SPSC_SLOTS + (__u32)(head & (SPSC_SLOTS - 1));
+		e = bpf_map_lookup_elem(&spsc_data, &idx);
+		if (e) {
+			if (with_ts)
+				fill(e);
+			else
+				fill_nots(e);
+			__atomic_store_n(&c->head, head + 1, __ATOMIC_RELEASE);
+		}
 	}
-	idx = cpu * SPSC_SLOTS + (__u32)(head & (SPSC_SLOTS - 1));
-	e = bpf_map_lookup_elem(&spsc_data, &idx);
-	if (e) {
-		if (with_ts)
-			fill(e);
-		else
-			fill_nots(e);
-		__atomic_store_n(&c->head, head + 1, __ATOMIC_RELEASE);
-	}
+	if (busy)
+		__atomic_store_n(&c->busy, 0, __ATOMIC_RELEASE);
 	bpf_preempt_enable();
 	return 0;
 }
@@ -266,11 +274,17 @@ static __always_inline int spsc_emit(bool with_ts)
 SEC("fentry")
 int BPF_PROG(spsc_out)
 {
-	return spsc_emit(true);
+	return spsc_emit(true, false);
 }
 
 SEC("fentry")
 int BPF_PROG(spsc_nots)
 {
-	return spsc_emit(false);
+	return spsc_emit(false, false);
+}
+
+SEC("fentry")
+int BPF_PROG(spsc_busy)
+{
+	return spsc_emit(false, true);
 }

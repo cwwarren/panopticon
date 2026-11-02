@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::ffi::CString;
 use std::fs::{self, File};
 use std::io::{self, Read, Write};
@@ -84,7 +85,7 @@ const SOCKETS: &[&str] = &[
     "/run/crio/crio.sock",
     "/run/podman/podman.sock",
 ];
-const CLASSES: [&str; 4] = ["proc", "net", "file", "admin"];
+const CLASSES: [&str; 5] = ["proc", "net", "file", "admin", "nat"];
 
 struct Ring {
     class: usize,
@@ -157,6 +158,7 @@ pub fn run(out_path: &str, poll: Duration) {
         &mut open.maps.ring_net,
         &mut open.maps.ring_file,
         &mut open.maps.ring_admin,
+        &mut open.maps.ring_nat,
     ] {
         map.set_max_entries(u32::try_from(ncpus).unwrap()).unwrap();
     }
@@ -233,6 +235,7 @@ fn map_rings(skel: &AgentSkel, ncpus: usize, nclasses: usize) -> Vec<Ring> {
         (types::ring_class::CLASS_NET, &skel.maps.ring_net),
         (types::ring_class::CLASS_FILE, &skel.maps.ring_file),
         (types::ring_class::CLASS_ADMIN, &skel.maps.ring_admin),
+        (types::ring_class::CLASS_NAT, &skel.maps.ring_nat),
     ];
     let mut rings = Vec::new();
     for (class, map) in classes {
@@ -467,6 +470,7 @@ fn push_snapshot(skel: &AgentSkel, buf: &mut Vec<u8>, hashes: &mut Hasher) {
         .unwrap();
     let fixed = size_of::<types::exec_rec>();
     let mut off = 0;
+    let mut cwds = HashSet::new();
     while off < raw.len() {
         let mut r: types::exec_rec = wire::read(&raw[off..]);
         let argv = &raw[off + fixed..off + fixed + usize::from(r.argv_len)];
@@ -486,7 +490,30 @@ fn push_snapshot(skel: &AgentSkel, buf: &mut Vec<u8>, hashes: &mut Hasher) {
         buf.extend_from_slice(argv);
         buf.resize(buf.len() + len - fixed - path.len() - argv.len(), 0);
         request_hash(hashes, &buf[start..]);
+        if r.cwd_ino != 0 && cwds.insert((r.cwd_dev, r.cwd_ino)) {
+            push_cwd(buf, &r);
+        }
     }
+}
+
+fn push_cwd(buf: &mut Vec<u8>, r: &types::exec_rec) {
+    let cwd = match fs::read_link(format!("/proc/{}/cwd", r.pid)) {
+        Ok(cwd) => cwd.into_os_string().into_vec(),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return,
+        Err(err) => panic!("readlink /proc/{}/cwd: {err}", r.pid),
+    };
+    wire::push(
+        buf,
+        types::rec_type::REC_PATH.0 as u8,
+        r.h.jiffies,
+        &[
+            &r.cwd_ino.to_ne_bytes(),
+            &r.cwd_dev.to_ne_bytes(),
+            &u16::try_from(cwd.len()).unwrap().to_ne_bytes(),
+            &[0u8; 2],
+            &cwd,
+        ],
+    );
 }
 
 fn drain_inotify(fd: RawFd) {

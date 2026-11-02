@@ -23,6 +23,8 @@ const LOGIN: u32 = types::rec_type::REC_LOGIN.0;
 const ADMIN: u32 = types::rec_type::REC_ADMIN.0;
 const RAW_SOCKET: u32 = types::rec_type::REC_RAW_SOCKET.0;
 const UNIX_CONNECT: u32 = types::rec_type::REC_UNIX_CONNECT.0;
+const NAT: u32 = types::rec_type::REC_NAT.0;
+const PATH: u32 = types::rec_type::REC_PATH.0;
 const META: u32 = wire::REC_META as u32;
 const CLOCK: u32 = wire::REC_CLOCK as u32;
 const LOSS: u32 = wire::REC_LOSS as u32;
@@ -97,6 +99,7 @@ struct Decoder {
     files: HashMap<FileKey, (types::actor, String)>,
     containers: HashMap<u64, String>,
     hashes: HashMap<(u32, u64, i64), String>,
+    paths: HashMap<(u32, u64), String>,
 }
 
 struct Obj(String);
@@ -190,6 +193,16 @@ const NAMESPACES: [(u64, &str); 8] = [
     (0x4000_0000, "net"),
 ];
 
+fn path_text(raw: &[u8]) -> String {
+    let s = text(raw);
+    if s.starts_with('/') {
+        return s;
+    }
+    let mut parts: Vec<&str> = s.split('\0').filter(|p| !p.is_empty()).collect();
+    parts.reverse();
+    format!("/{}", parts.join("/"))
+}
+
 fn hash_rec(rec: &[u8]) -> ((u32, u64, i64), u64, String) {
     let (ino, dev_id, ctime, size): (u64, u32, i64, u64) = (
         read(&rec[wire::HDR..]),
@@ -253,6 +266,11 @@ impl Decoder {
                     i128::from(realtime / 1_000_000) - i128::from(boottime / 1_000_000);
             }
             META => self.hz = u64::from(read::<u32>(&rec[wire::HDR + 4..])),
+            PATH => {
+                let r: types::path_rec = read(rec);
+                let raw = &rec[size_of::<types::path_rec>()..][..usize::from(r.len)];
+                self.paths.insert((r.dev, r.ino), path_text(raw));
+            }
             HASH => {
                 let (key, _, digest) = hash_rec(rec);
                 self.hashes.insert(key, digest);
@@ -354,6 +372,14 @@ impl Decoder {
                                 ..usize::from(boot_len) + usize::from(host_len)],
                         ),
                     )
+            }
+            PATH => {
+                let r: types::path_rec = read(rec);
+                let raw = &rec[size_of::<types::path_rec>()..][..usize::from(r.len)];
+                Obj::new("path", ts)
+                    .str("dev", &dev(r.dev))
+                    .num("ino", r.ino)
+                    .str("path", &path_text(raw))
             }
             HASH => {
                 let ((dev_id, ino, ctime), size, digest) = hash_rec(rec);
@@ -471,6 +497,29 @@ impl Decoder {
                     .str("dev", &dev(r.dev))
                     .num("ino", r.ino)
             }
+            NAT => {
+                let r: types::nat_rec = read(rec);
+                Obj::new("nat", ts)
+                    .str("manip", if r.manip == 0 { "snat" } else { "dnat" })
+                    .num("proto", r.proto)
+                    .str(
+                        "orig",
+                        &format!(
+                            "{} -> {}",
+                            addr(r.family, &r.orig_src, r.orig_sport),
+                            addr(r.family, &r.orig_dst, r.orig_dport)
+                        ),
+                    )
+                    .str(
+                        "reply",
+                        &format!(
+                            "{} -> {}",
+                            addr(r.family, &r.reply_src, r.reply_sport),
+                            addr(r.family, &r.reply_dst, r.reply_dport)
+                        ),
+                    )
+                    .num("netns", r.netns)
+            }
             other => panic!("unknown record type {other}"),
         };
         Some(line.done())
@@ -534,6 +583,22 @@ impl Decoder {
             .str("exe_mode", &format!("{:o}", r.exe_mode))
             .num("exe_nlink", r.exe_nlink)
             .str("exe_fs", &fs_name(r.exe_magic))
+            .num("exe_upper", r.exe_flags & 1 != 0)
+            .raw(
+                "stdio_socket",
+                &format!(
+                    "[{},{},{}]",
+                    r.exe_flags & 2 != 0,
+                    r.exe_flags & 4 != 0,
+                    r.exe_flags & 8 != 0
+                ),
+            )
+            .str(
+                "cwd",
+                self.paths
+                    .get(&(r.cwd_dev, r.cwd_ino))
+                    .map_or("", String::as_str),
+            )
             .str(
                 "sha256",
                 self.hashes

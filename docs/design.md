@@ -12,14 +12,16 @@ Collect host security telemetry at the lowest possible cost to the host.
 
 Collected:
 
-- Process starts, which carry most of the security value, with attribution: spawner, binary, user and
-  session, container.
+- Process starts and ends, which carry most of the security value, with attribution: spawner, binary
+  (path, SHA-256, file mode, link count, filesystem), user and session, terminal, container.
 - Network attribution: the process and container behind a connection, keyed so it joins against network
-  flow logs, including the post-NAT tuple.
+  flow logs, including the post-NAT tuple. TCP and UDP over IPv4 and IPv6, raw and packet sockets,
+  connections to container runtime sockets.
 - DNS queries and answers on the standard resolver paths.
-- Access to a fixed list of sensitive files and directories.
-- Privileged kernel and admin operations: module load, BPF load, sysctl writes, mounts and namespaces,
-  cross-process memory access, credential changes, kexec, clock changes.
+- Reads of credentials, and changes to persistence and integrity locations.
+- Privileged kernel and admin operations: module and kexec loads, BPF loads, sysctl writes, mounts and
+  namespaces, cross-process memory access, credential changes, clock changes; logins.
+- Container identity: runtime, image, name, pod and namespace, privileged and host-namespace flags.
 - Sensor health: losses per event class.
 
 Not collected: payloads, flow volume (the network side has it), on-host detection rules, prevention.
@@ -166,13 +168,13 @@ has its own ring on every CPU.
 
 | Class | Hooks | Context | Records |
 |---|---|---|---|
-| proc | `tp_btf/sched_process_fork` (state only), `lsm.s/bprm_committed_creds`, `tp_btf/cgroup_mkdir` | process | exec, cgroup |
-| net | `fexit/tcp_v4_connect`, `fexit/tcp_v6_connect`, `fexit/inet_csk_accept`, `fexit/inet_listen`, `fexit/udp_sendmsg`, `fentry/skb_consume_udp` | process | connect, accept, listen, UDP first send, DNS query, DNS answer |
-| file | `fentry/inotify_handle_inode_event` (our group only), `iter/bpf_map_elem` on the coalescing map | process | sensitive file access, repeat count |
-| nat | `fexit/nf_nat_setup_info` | process or softirq | NAT translation (planned) |
-| admin | LSM hooks for module, bpf, mount, ptrace attach, setuid/capset, settime, kexec; `cgroup/sysctl` | process | admin operation (planned) |
+| proc | `tp_btf/sched_process_fork` (state only), `lsm.s/bprm_committed_creds`, `tp_btf/sched_process_exit`, `fexit/audit_set_loginuid`, `tp_btf/cgroup_mkdir` | process | exec, exit, login, cgroup |
+| net | `fexit/tcp_v4_connect`, `fexit/tcp_v6_connect`, `fexit/inet_csk_accept`, `fexit/inet_listen`, `fexit/udp_sendmsg`, `fexit/udpv6_sendmsg`, `fentry/skb_consume_udp`, `fexit/packet_create`, `fexit/raw_sk_init`, `fexit/rawv6_init_sk`, `lsm/unix_stream_connect` | process | connect, accept, listen, UDP first send, DNS query, DNS answer, raw socket, unix connect |
+| file | `fentry/inotify_handle_inode_event` (our group only), `iter/bpf_map_elem` on the coalescing map | process | file access or change, repeat count |
+| admin | LSM hooks for module and kexec loads, BPF loads, ptrace access in attach mode, traceme, uid/gid/capability changes, mount/move_mount/umount/pivot_root, settime, user namespaces; `fentry/proc_sys_write`; `fexit/create_new_namespaces` and the eight `*ns_install` callbacks | process | admin operation |
+| nat | `fexit/nf_nat_setup_info` (`nf_nat` module) | process or softirq | NAT translation |
 
-Fork and exit produce no records. Exits are not observed at all.
+Fork produces no records. Process exit produces one record when the last thread exits.
 
 ### Identity and process records
 
@@ -187,16 +189,27 @@ Fork and exit produce no records. Exits are not observed at all.
   the image key, so a child that forks without exec'ing joins back to the program it is running.
 - One exec record per successful exec, emitted after the point of no return: process key, exec
   sequence, spawner, current parent, previous image key (the program that called exec), cgroup id,
-  uid/euid/gid/egid, loginuid, sessionid, effective capabilities, executable dev/inode/ctime,
-  executable path, argv (bounded, never the environment). The previous image key attributes an exec
-  by a fork-only child (a subshell, a double-forked daemon) to the program it was running, without
-  fork records.
+  uid/euid/gid/egid, loginuid, sessionid, effective capabilities, controlling terminal, executable
+  dev/inode/ctime, mode, link count and filesystem magic, executable path, argv (bounded, never the
+  environment). The previous image key attributes an exec by a fork-only child (a subshell, a
+  double-forked daemon) to the program it was running, without fork records. Mode, link count and
+  filesystem make setuid binaries, deleted executables and memfd execution (`nlink` 0 on tmpfs)
+  visible without extra hooks.
+- One exit record when a process's last thread exits (`sched_process_exit` with `group_dead`): wait
+  status, total CPU time, start time (`start_boottime`, converted with the boottime reference in the
+  clock record). 70 ns per process exit.
+- One login record when `/proc/self/loginuid` is set (PAM `pam_loginuid`): new loginuid and session.
 - Processes that exist when the agent starts are emitted once by a BPF task iterator, in the same
   record format. The verifier rejects `bpf_d_path` on `mm->exe_file` (a walked, untrusted pointer)
   and the kfuncs that return a trusted file are LSM-only, so the agent fills these executable paths
   from `/proc/<pid>/exe` at startup.
+- Executable hashes: userspace queues each distinct (dev, inode, ctime) once to a worker thread
+  running `SCHED_IDLE` with idle I/O priority. It hashes `/proc/<pid>/exe` (the exact inode even if the
+  path was replaced or deleted), falling back to the recorded path with the key verified, and drops the
+  pages it read (`POSIX_FADV_DONTNEED`: a 200 MB binary left 0 bytes resident, 190.8 MB without). This
+  host's 91 running binaries (4.07 GB) hash in about 25 s of idle time.
 
-Volume is one record per exec plus the one-time snapshot.
+Volume is one record per exec and per process exit, plus the one-time snapshot.
 
 ### Records
 
@@ -209,8 +222,12 @@ Records reference each other only through kernel identities (process key, image 
 cgroup id, inode). The consumer drains rings one after another, so stream order is not time order;
 the decoder indexes identities in a first pass and emits in a second.
 
-Time is jiffies (1 ms at `HZ=1000`). Userspace emits a clock record (jiffies, `CLOCK_REALTIME`) every
-second, and the decoder converts.
+Userspace adds its own record types to the same stream: meta (host, boot id, CPU count, HZ), clock,
+loss, watch (each marked path or watched socket with its dev and inode), container and hash.
+
+Time is jiffies (1 ms at `HZ=1000`). Userspace emits a clock record (jiffies, `CLOCK_REALTIME`,
+`CLOCK_BOOTTIME`) every second, and the decoder converts; the boottime reference converts kernel start
+times.
 
 ### Transport
 
@@ -220,10 +237,11 @@ control block per (class, CPU) holds `head`, `tail` and `drops` on separate cach
 Producer:
 
 1. `bpf_preempt_disable()`.
-2. Load `tail` with acquire; if `head + max_record - tail > size`, count a drop.
-3. Write the record at `head & (size - 1)`. A record that runs past the end continues into the slack
+2. Take the ring's busy flag with an atomic exchange; if it was already set, count a drop.
+3. Load `tail` with acquire; if `head + max_record - tail > size`, count a drop and release the flag.
+4. Write the record at `head & (size - 1)`. A record that runs past the end continues into the slack
    bytes, so records are always contiguous and never split or padded.
-4. Store `head + len` with release; `bpf_preempt_enable()`.
+5. Store `head + len` with release, release the busy flag with release, `bpf_preempt_enable()`.
 
 Consumer: one thread polls every ring every 10 ms, copies whole records to the output buffer, stores
 `tail` with release. No syscalls per record, no wakeups.
@@ -232,9 +250,15 @@ Safety comes from the same structure that makes it fast:
 
 - One ring per CPU means one producer per ring unless the producer is interrupted.
 - Preemption is disabled for the few nanoseconds of the write.
-- Each class's hooks run in a single kind of context, so an interrupt never re-enters the same ring.
-  The nat class can run in softirq as well as process context and needs a per-ring busy flag (to be
-  measured).
+- The busy flag turns any nested producer on the same CPU (a softirq interrupting a task-context
+  producer of the nat class, an NMI, a future hook in an unexpected context) into a counted drop instead
+  of a corrupted ring, so no class depends on its hooks running in one kind of context. Uncontended it
+  costs nothing measurable: 52.10 ns against 52.29 ns per `getppid` with an emitting program (41.23 ns
+  without one), medians of 11 interleaved pinned runs of `crates/ringbench` variants `spsc_busy` and
+  `spsc_nots`.
+- Drop counters are incremented atomically, because a nested producer can race the holder.
+- Every writer stays within the `max_record` bytes it reserved. The verifier only checks that writes
+  stay inside the map value, so this is a code invariant, not a verifier guarantee.
 
 Kernel requirements: `bpf_preempt_disable` (6.10), BPF load-acquire/store-release (6.15), BPF LSM,
 task and socket local storage.
@@ -243,30 +267,37 @@ All classes use the same mechanism. Sharing one ring between low-rate classes wo
 add a second code path.
 
 Ring sizes are compile-time per class and sized from expected rate × poll interval × headroom. The
-prototype uses 256 KiB per CPU for proc and net and 64 KiB for file (about 18 MiB on 32 CPUs).
+prototype uses 256 KiB per CPU for proc and net and 64 KiB for file, admin and nat (22 MiB on 32 CPUs).
 
 ### Userspace
 
 One thread:
 
-- Poll all rings; append whole records to an output buffer.
+- Poll all rings; append whole records to an output buffer. The only record bytes it reads are the
+  header and two record types: a cgroup record triggers container resolution, an exec record queues a
+  hash.
 - Drain the inotify fd. Its events are not used (the BPF hook is the event source); draining keeps
   their kernel memory near zero and does not change the producer's cost (+87.4 ns per marked open
   drained, +89.2 ns never read).
 - Once per second and at shutdown: clock record, a loss record for any ring whose drop counter
   moved, and the repeat records from the file coalescing iterator.
+- Collect finished hashes from the hashing worker.
 - Write the buffer to the sink.
-
-No parsing on the hot path. Container metadata (image, pod) is resolved once per new cgroup, not per
-record (planned).
 
 ### Containers
 
 Records carry the cgroup id (`bpf_get_current_cgroup_id`, 8 bytes, ~2 ns). The proc class emits a
 cgroup record with the path from `cgroup_mkdir`, and the agent emits records for cgroups that already
-exist at start, so short-lived containers resolve even after their cgroup is gone. Container id comes
-from the cgroup path (`docker-<id>.scope`, `cri-containerd-<id>.scope`); image and pod come from the
-runtime API once per container (planned).
+exist at start, so short-lived containers resolve even after their cgroup is gone.
+
+For a cgroup whose name holds a container id (`docker-<id>.scope`, `cri-containerd-<id>.scope`,
+`crio-<id>.scope`, `libpod-<id>.scope`, or a 64-hex leaf under `/docker/` or `kubepods`), the agent reads
+the runtime's own state files once and emits a container record: docker's `config.v2.json` and
+`hostconfig.json`; for containerd, CRI-O and podman, the OCI `config.json` of the bundle, whose CRI
+annotations give container name, pod, namespace and image. Flags: privileged (docker `Privileged`, or
+`CAP_SYS_ADMIN` in the OCI bounding set), host PID and host network namespaces, pod sandbox. No runtime
+API calls and no per-record work. The decoder attaches the container to every record whose cgroup
+belongs to one.
 
 ### Network attribution
 
@@ -276,25 +307,46 @@ namespace, process key, image key, cgroup, time.
 - TCP out: `fexit/tcp_v4_connect` and `tcp_v6_connect`, after the source port is assigned.
 - TCP in: `fexit/inet_csk_accept`, in the accepting process.
 - Listen: `fexit/inet_listen`.
-- UDP, IPv4 only (`udpv6_sendmsg` is not hooked yet): `fexit/udp_sendmsg`. Each destination is
-  checked against the socket's last 4 in socket-local storage, and a new one emits a record. After 16
-  records the socket is flagged saturated and reports nothing more; its own tuple joins the rest of
-  its flows. `connect()` on UDP without traffic is not recorded because no flow follows it.
-- DNS, IPv4 only: every query payload from `udp_sendmsg` when the destination port is 53; the socket
-  is tagged, and answers are copied from `skb_consume_udp` for tagged sockets only. Covers glibc and
-  musl stub resolvers, systemd-resolved's stub, Docker's resolver paths and CoreDNS. Not covered: DoH,
-  DoT, DoQ, TCP port 53, systemd-resolved's varlink clients.
-- NAT (planned): `fexit/nf_nat_setup_info`, emitted only when the tuple was translated. Cilium with BPF
-  masquerade keeps NAT state in its own map (`cilium_snat_v4_external`) and needs a version-pinned
-  reader; not testable on this host.
+- UDP over IPv4 and IPv6: `fexit/udp_sendmsg` and `fexit/udpv6_sendmsg` share one path. Each
+  destination (16-byte address and port) is checked against the socket's last 4 in socket-local
+  storage, and a new one emits a record. After 16 records the socket is flagged saturated and reports
+  nothing more; its own tuple joins the rest of its flows. A send to an IPv4-mapped address is recorded
+  once, by the IPv4 hook. `connect()` on UDP without traffic is not recorded because no flow follows it.
+- DNS over IPv4 and IPv6: every query payload when the destination port is 53; the socket is tagged,
+  and answers are copied from `skb_consume_udp` for tagged sockets only. Covers glibc and musl stub
+  resolvers, systemd-resolved's stub, Docker's resolver paths and CoreDNS. Not covered: DoH, DoT, DoQ,
+  TCP port 53, systemd-resolved's varlink clients.
+- Raw and packet sockets: `fexit/packet_create`, `fexit/raw_sk_init` and `fexit/rawv6_init_sk`, the
+  family constructors, so no other socket creation pays. Kernel control sockets are excluded.
+- Unix stream connects to container runtime sockets (docker, containerd, k3s containerd, CRI-O,
+  podman): `lsm/unix_stream_connect`, filtered by the target socket's inode. This hook runs for every
+  unix stream connect, 19 ns each; nothing in the kernel indexes unix connects by target, so this is the
+  one new cost on unrelated activity.
+- NAT: `fexit/nf_nat_setup_info` in the `nf_nat` module; one record per call whose own manipulation
+  changed the tuple (SNAT compares the original source with the reply destination, DNAT the original
+  destination with the reply source): original and reply tuples, protocol, network namespace. No
+  actor: the hook also runs in softirq context, where the current task is unrelated; the original tuple
+  joins the record to the container's connect record. Docker egress `172.17.0.2:54560 -> 1.1.1.1:80`
+  is recorded with reply `1.1.1.1:80 -> 192.168.1.18:54560`. Cilium with BPF masquerade keeps NAT state
+  in its own map (`cilium_snat_v4_external`) and needs a version-pinned reader; not testable on this
+  host.
 
-### Sensitive files
+### Credentials, persistence and integrity
 
-A fixed list of files and directories, each with an event mask. Credential files (`/etc/shadow`,
-`/etc/gshadow`, `/etc/sudoers`, SSH host keys): open, close after write, attribute change, move and
-delete. Credential directories (`/etc/sudoers.d`, `~/.ssh`): the same plus entry create, delete and
-move. Public but integrity-sensitive files (`/etc/passwd`, `/etc/group`, `/etc/ld.so.preload`): close
-after write, attribute change, move and delete.
+Two kinds of inotify marks:
+
+- Reads of credentials: `IN_OPEN` marks on `/etc/shadow`, `/etc/gshadow`, `/etc/security/opasswd` and
+  the SSH host private keys; `IN_OPEN` plus change events on the credential directories of every home
+  (`.ssh`, `.aws`, `.kube`, `.docker`, `.config/gcloud`, `.gnupg`).
+- Changes to persistence and integrity locations: directory marks with close-after-write, modify,
+  attribute, create, delete and move events on `/etc` (top level), cron and at spools, systemd unit
+  directories (system and user, and each existing subdirectory of `/etc/systemd/system`), `init.d`,
+  `profile.d`, `ld.so.conf.d`, PAM configuration and module directories, `sudoers.d`, sshd
+  configuration, udev rules, module-loading configuration, `update-motd.d`, APT hooks, XDG autostart,
+  `/boot`, the system binary and multiarch library directories, and each home directory with its
+  autostart and systemd user directories. A directory mark sees files created after startup (a new
+  `/etc/ld.so.preload`) and replacement by rename, which per-file marks miss. Reads in these
+  directories are not marked: every process start reads `/etc/ld.so.cache`.
 
 - The agent owns one inotify group with marks on the listed inodes, and learns the kernel address of
   that group from `fentry/inotify_update_watch`.
@@ -306,10 +358,8 @@ after write, attribute change, move and delete.
   `bpf_map_elem` iterator, read once per second and at shutdown, swaps each counter with zero and
   emits a repeat record. With `self_exec_id` in the key, a program exec'd by the process gets its own
   record instead of disappearing into the previous program's count.
-- Containers: mark each container's copy through `/proc/<pid>/root/<path>` when the container starts
-  (planned).
-- Replacement by rename (e.g. `passwd` rewriting `/etc/shadow`): directory marks on the parents for
-  create and move, then re-mark (planned).
+- Not marked: subdirectories created after startup, and the copies inside containers (marking them
+  through `/proc/<pid>/root/<path>` at container start is planned).
 
 Cost of an access to a listed file, open+close of `/etc/shadow` (`bench/results/experiments/marked_open.sh`,
 medians of 5, 488 ns base):
@@ -327,13 +377,37 @@ attach, and fanotify has no BPF hooks. Unlisted files pay nothing.
 Limit: with more than 4096 keys active within one second, LRU eviction drops the pending counts of
 evicted keys without a loss record. Every access after an eviction still emits a full record.
 
-### Admin operations (planned)
+### Admin operations
 
-LSM hooks fire only on the operation itself: `kernel_read_file`/`kernel_load_data` (modules, kexec),
-`bpf_prog_load` (excluding the agent), `sb_mount`/`move_mount`/`sb_pivotroot`, `ptrace_access_check`
-in attach mode only (covers ptrace, `/proc/<pid>/mem`, `process_vm_*`, `pidfd_getfd`), `task_fix_setuid`,
-`capset`, `settime`. Sysctl writes come from a `cgroup/sysctl` program on the root cgroup. Namespace
-creation is visible at fork by comparing `nsproxy`.
+Hooks that fire only on the operation itself:
+
+| Operation | Hook | Recorded |
+|---|---|---|
+| Module load from a file, including compressed modules | `lsm.s/kernel_read_file` (`READING_MODULE`, `READING_MODULE_COMPRESSED`) | path, dev, inode |
+| Module load from memory | `lsm/kernel_load_data` | operation only |
+| kexec | the same two hooks with the kexec ids | path, or memory |
+| BPF program load | `lsm/bpf_prog_load`, user loads only | name, program and attach type, instruction count, attach BTF id |
+| ptrace attach, `/proc/<pid>/mem`, `process_vm_*`, `pidfd_getfd` | `lsm/ptrace_access_check`, attach mode only | target process key and pid, mode |
+| `PTRACE_TRACEME` | `lsm/ptrace_traceme` | tracer |
+| uid and gid changes | `lsm/task_fix_setuid`, `lsm/task_fix_setgid` | old and new real/effective/saved/fs ids, when the real id changes or any id becomes 0 |
+| Capability changes | `lsm/capset` | old and new effective, permitted, inheritable |
+| mount, move_mount, pivot_root | `lsm.s/sb_mount` (`bpf_d_path`); `lsm/move_mount` and `lsm/sb_pivotroot` (`bpf_path_d_path` kfunc: these hooks are not sleepable) | target, source, filesystem type, flags |
+| umount | `lsm/sb_umount` | filesystem type, dev, flags |
+| Clock set | `lsm/settime` | new time |
+| sysctl write | `fentry/proc_sys_write`, writes only | name (bounded dentry walk), value |
+| Namespace creation | `fexit/create_new_namespaces` | types, unshare or clone, new net and mount namespace inodes |
+| setns | `fexit` on the eight `*ns_install` callbacks, which serve both the fd and the pidfd path | type, target namespace inode |
+| User namespace creation | `lsm/userns_create` | euid |
+
+All LSM programs return 0 on every path: none of them can deny an operation. A `cgroup/sysctl` program
+was rejected because cgroup programs cannot call `bpf_get_current_task_btf` and so cannot fill the actor.
+
+Volume: a container start on this host (k3s, runc, Cilium CNI) produces about 50-80 admin records
+(mounts, setns, privilege drops, pivot_root, device-cgroup and CNI BPF loads).
+
+Not observable at these hooks, by design: attempts that fail before the security check
+(`kexec_file_load` with a bad fd, `clock_settime` on a clock that cannot be set), and operations on hot
+paths that are deliberately not hooked: `kill`, `mprotect`, `mmap` with `PROT_EXEC`.
 
 ## Decision log
 

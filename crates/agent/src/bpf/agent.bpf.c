@@ -16,6 +16,16 @@ char LICENSE[] SEC("license") = "GPL";
 #define IS_ERR_PTR(p) ((unsigned long)(p) >= (unsigned long)-4095)
 #define ADMIN_STR 256
 #define BPF_NAME 16
+#define NF_ACCEPT 1
+#define NF_NAT_MANIP_SRC 0
+#define OVERLAYFS_SUPER_MAGIC 0x794c7630
+#define S_IFMT 00170000
+#define S_IFSOCK 0140000
+#define PATH_WALK 256
+#define PATH_DEPTH 24
+#define PATH_NAME 64
+#define EXE_UPPER 1
+#define STDIN_SOCK 2
 #define SYSCTL_DEPTH 8
 #define SYSCTL_NAME 64
 #define SYSCTL_VALUE 64
@@ -25,6 +35,7 @@ enum ring_class {
 	CLASS_NET,
 	CLASS_FILE,
 	CLASS_ADMIN,
+	CLASS_NAT,
 	NR_CLASSES,
 };
 
@@ -44,6 +55,8 @@ enum rec_type {
 	REC_ADMIN,
 	REC_RAW_SOCKET,
 	REC_UNIX_CONNECT,
+	REC_NAT,
+	REC_PATH,
 };
 
 enum rec_flag {
@@ -93,10 +106,12 @@ enum admin_op anchor_admin_op;
 #define NET_RING (256 << 10)
 #define FILE_RING (64 << 10)
 #define ADMIN_RING (64 << 10)
+#define NAT_RING (64 << 10)
 #define PROC_SLACK 4096
 #define NET_SLACK 2048
 #define FILE_SLACK 512
 #define ADMIN_SLACK 1024
+#define NAT_SLACK 256
 
 #define UDP_SEEN 4
 #define UDP_CAP 16
@@ -130,6 +145,7 @@ struct exec_rec {
 	__u64 exe_ino;
 	__s64 exe_ctime;
 	__u64 cap_eff;
+	__u64 cwd_ino;
 	__u32 exe_dev;
 	__u32 pid;
 	__u32 ppid;
@@ -139,6 +155,7 @@ struct exec_rec {
 	__u32 egid;
 	__u32 loginuid;
 	__u32 sessionid;
+	__u32 cwd_dev;
 	__u32 argc;
 	__u32 tty;
 	__u32 exe_nlink;
@@ -146,7 +163,7 @@ struct exec_rec {
 	__u16 exe_mode;
 	__u16 path_len;
 	__u16 argv_len;
-	__u16 pad[3];
+	__u16 exe_flags;
 	__u8 data[];
 };
 
@@ -246,6 +263,23 @@ struct unix_rec {
 #define CGROUP_MAX (sizeof(struct cgroup_rec) + CGROUP_PATH_MAX)
 #define SOCK_MAX (sizeof(struct sock_rec) + DNS_MAX)
 #define FILE_MAX (sizeof(struct file_rec) + NAME_MAX_REC)
+struct nat_rec {
+	struct rec_hdr h;
+	__u8 orig_src[16];
+	__u8 orig_dst[16];
+	__u8 reply_src[16];
+	__u8 reply_dst[16];
+	__u16 orig_sport;
+	__u16 orig_dport;
+	__u16 reply_sport;
+	__u16 reply_dport;
+	__u32 netns;
+	__u8 family;
+	__u8 proto;
+	__u8 manip;
+	__u8 pad;
+};
+
 #define ADMIN_MAX (sizeof(struct admin_rec) + 2 * ADMIN_STR)
 
 struct exec_rec anchor_exec;
@@ -258,10 +292,29 @@ struct login_rec anchor_login;
 struct admin_rec anchor_admin;
 struct raw_rec anchor_raw;
 struct unix_rec anchor_unix;
+struct nat_rec anchor_nat;
+
+struct path_rec {
+	struct rec_hdr h;
+	__u64 ino;
+	__u32 dev;
+	__u16 len;
+	__u16 pad;
+	__u8 path[];
+};
+
+struct path_rec anchor_path;
+
+struct ovl_inode___pano {
+	struct inode vfs_inode;
+	struct dentry *__upperdentry;
+} __attribute__((preserve_access_index));
 
 struct ctl {
 	__u64 head;
-	__u64 pad0[7];
+	__u32 busy;
+	__u32 pad_busy;
+	__u64 pad0[6];
 	__u64 tail;
 	__u64 pad1[7];
 	__u64 drops;
@@ -282,6 +335,10 @@ struct ring_file_value {
 
 struct ring_admin_value {
 	__u8 data[ADMIN_RING + ADMIN_SLACK];
+};
+
+struct ring_nat_value {
+	__u8 data[NAT_RING + NAT_SLACK];
 };
 
 struct {
@@ -315,6 +372,14 @@ struct {
 	__type(key, __u32);
 	__type(value, struct ring_admin_value);
 } ring_admin SEC(".maps");
+
+struct {
+	__uint(type, BPF_MAP_TYPE_ARRAY);
+	__uint(map_flags, BPF_F_MMAPABLE);
+	__uint(max_entries, 1);
+	__type(key, __u32);
+	__type(value, struct ring_nat_value);
+} ring_nat SEC(".maps");
 
 struct {
 	__uint(type, BPF_MAP_TYPE_ARRAY);
@@ -377,6 +442,13 @@ struct {
 } unix_watch SEC(".maps");
 
 struct {
+	__uint(type, BPF_MAP_TYPE_LRU_HASH);
+	__uint(max_entries, 4096);
+	__type(key, struct inode_key);
+	__type(value, __u8);
+} cwd_seen SEC(".maps");
+
+struct {
 	__uint(type, BPF_MAP_TYPE_SK_STORAGE);
 	__uint(map_flags, BPF_F_NO_PREALLOC);
 	__type(key, int);
@@ -421,10 +493,15 @@ static __always_inline void *reserve(void *ring, __u32 class, __u32 size, __u32 
 
 	if (!c || !base)
 		return NULL;
+	if (__sync_lock_test_and_set(&c->busy, 1)) {
+		__sync_fetch_and_add(&c->drops, 1);
+		return NULL;
+	}
 	head = c->head;
 	tail = __atomic_load_n(&c->tail, __ATOMIC_ACQUIRE);
 	if (head + max - tail > size) {
-		c->drops += 1;
+		__sync_fetch_and_add(&c->drops, 1);
+		__atomic_store_n(&c->busy, 0, __ATOMIC_RELEASE);
 		return NULL;
 	}
 	s->c = c;
@@ -441,6 +518,7 @@ static __always_inline void commit(struct ring_slot *s, struct rec_hdr *h, __u32
 	h->reserved = 0;
 	h->jiffies = bpf_jiffies64();
 	__atomic_store_n(&s->c->head, s->head + len, __ATOMIC_RELEASE);
+	__atomic_store_n(&s->c->busy, 0, __ATOMIC_RELEASE);
 }
 
 static __always_inline void fill_actor(struct actor *a)
@@ -505,6 +583,73 @@ static __always_inline void emit_sock(struct sock *sk, __u8 type)
 		commit(&s, &r->h, sizeof(*r), type, 0);
 	}
 	bpf_preempt_enable();
+}
+
+static __always_inline __u16 exe_flags(struct task_struct *task, struct inode *inode)
+{
+	struct file **fds = BPF_CORE_READ(task, files, fdt, fd);
+	__u16 flags = 0;
+
+	if (bpf_core_type_exists(struct ovl_inode___pano) &&
+	    BPF_CORE_READ(inode, i_sb, s_magic) == OVERLAYFS_SUPER_MAGIC) {
+		long delta = bpf_core_field_offset(struct ovl_inode___pano, __upperdentry) -
+			     bpf_core_field_offset(struct ovl_inode___pano, vfs_inode);
+		void *upper = NULL;
+
+		bpf_probe_read_kernel(&upper, sizeof(upper), (void *)((unsigned long)inode + delta));
+		if (upper)
+			flags |= EXE_UPPER;
+	}
+	for (int i = 0; i < 3; i++) {
+		struct file *f = NULL;
+
+		bpf_probe_read_kernel(&f, sizeof(f), &fds[i]);
+		if (f && (BPF_CORE_READ(f, f_inode, i_mode) & S_IFMT) == S_IFSOCK)
+			flags |= STDIN_SOCK << i;
+	}
+	return flags;
+}
+
+static __always_inline void emit_path(__u32 dev, __u64 ino, struct dentry *d, struct vfsmount *vmnt)
+{
+	struct inode_key k = { .ino = ino, .dev = dev };
+	struct mount *mnt = (void *)((unsigned long)vmnt - bpf_core_field_offset(struct mount, mnt));
+	struct path_rec *r;
+	struct ring_slot s;
+	__u32 pos = 0;
+	__u8 one = 1;
+	long n;
+
+	if (!ino || bpf_map_lookup_elem(&cwd_seen, &k))
+		return;
+	bpf_map_update_elem(&cwd_seen, &k, &one, BPF_ANY);
+	r = reserve(&ring_proc, CLASS_PROC, PROC_RING, sizeof(*r) + PATH_WALK, &s);
+	if (!r)
+		return;
+	for (int i = 0; i < PATH_DEPTH; i++) {
+		struct dentry *root = BPF_CORE_READ(mnt, mnt.mnt_root);
+		struct mount *parent = BPF_CORE_READ(mnt, mnt_parent);
+
+		if (d == root) {
+			if (parent == mnt)
+				break;
+			d = BPF_CORE_READ(mnt, mnt_mountpoint);
+			mnt = parent;
+			continue;
+		}
+		if (pos >= PATH_WALK - PATH_NAME)
+			break;
+		n = bpf_probe_read_kernel_str(r->path + (pos & (PATH_WALK - 1)), PATH_NAME, BPF_CORE_READ(d, d_name.name));
+		if (n <= 0)
+			break;
+		pos += n;
+		d = BPF_CORE_READ(d, d_parent);
+	}
+	r->ino = ino;
+	r->dev = dev;
+	r->len = pos;
+	r->pad = 0;
+	commit(&s, &r->h, sizeof(*r) + pos, REC_PATH, 0);
 }
 
 static __always_inline __u32 tty_dev(struct task_struct *task)
@@ -611,12 +756,18 @@ int BPF_PROG(on_exec, struct linux_binprm *bprm)
 	__u64 spawner = 0, prev_proc = 0, prev_seq = 0;
 	__u32 path_len = 0, pos = 0;
 	__u8 flags = 0;
+	struct path pwd;
+	__u64 cwd_ino;
+	__u32 cwd_dev;
 	struct task_meta *m;
 	struct exec_rec *r;
 	struct ring_slot s;
 	char *argv;
 	long n;
 
+	BPF_CORE_READ_INTO(&pwd, task, fs, pwd);
+	cwd_ino = BPF_CORE_READ(pwd.dentry, d_inode, i_ino);
+	cwd_dev = BPF_CORE_READ(pwd.dentry, d_inode, i_sb, s_dev);
 	m = bpf_task_storage_get(&task_meta, task, 0, BPF_LOCAL_STORAGE_GET_F_CREATE);
 	if (m) {
 		spawner = m->spawner;
@@ -639,6 +790,8 @@ int BPF_PROG(on_exec, struct linux_binprm *bprm)
 		r->exe_ino = inode->i_ino;
 		r->exe_ctime = inode->i_ctime_sec;
 		r->cap_eff = BPF_CORE_READ(task, cred, cap_effective.val);
+		r->cwd_ino = cwd_ino;
+		r->cwd_dev = cwd_dev;
 		r->exe_dev = inode->i_sb->s_dev;
 		r->pid = task->tgid;
 		r->ppid = BPF_CORE_READ(task, real_parent, tgid);
@@ -653,7 +806,7 @@ int BPF_PROG(on_exec, struct linux_binprm *bprm)
 		r->exe_nlink = inode->i_nlink;
 		r->exe_magic = inode->i_sb->s_magic;
 		r->exe_mode = inode->i_mode;
-		__builtin_memset(r->pad, 0, sizeof(r->pad));
+		r->exe_flags = exe_flags(task, inode);
 
 		n = bpf_d_path(&file->f_path, (char *)r->data, PATH_MAX_REC);
 		if (n > 1)
@@ -677,6 +830,7 @@ int BPF_PROG(on_exec, struct linux_binprm *bprm)
 		r->path_len = path_len;
 		r->argv_len = pos;
 		commit(&s, &r->h, sizeof(*r) + path_len + pos, REC_EXEC, flags);
+		emit_path(cwd_dev, cwd_ino, pwd.dentry, pwd.mnt);
 	}
 	bpf_preempt_enable();
 	return 0;
@@ -1095,6 +1249,8 @@ int snapshot(struct bpf_iter__task *ctx)
 	r->parent = BPF_CORE_READ(task, real_parent, group_leader, thread_pid, ino);
 	r->cgroup = BPF_CORE_READ(task, cgroups, dfl_cgrp, kn, id);
 	r->cap_eff = BPF_CORE_READ(task, cred, cap_effective.val);
+	r->cwd_ino = BPF_CORE_READ(task, fs, pwd.dentry, d_inode, i_ino);
+	r->cwd_dev = BPF_CORE_READ(task, fs, pwd.dentry, d_inode, i_sb, s_dev);
 	r->pid = task->tgid;
 	r->ppid = BPF_CORE_READ(task, real_parent, tgid);
 	r->uid = BPF_CORE_READ(task, cred, uid.val);
@@ -1108,7 +1264,7 @@ int snapshot(struct bpf_iter__task *ctx)
 	r->exe_nlink = 0;
 	r->exe_magic = 0;
 	r->exe_mode = 0;
-	__builtin_memset(r->pad, 0, sizeof(r->pad));
+	r->exe_flags = 0;
 	r->exe_ino = 0;
 	r->exe_dev = 0;
 	r->exe_ctime = 0;
@@ -1120,6 +1276,7 @@ int snapshot(struct bpf_iter__task *ctx)
 		r->exe_nlink = BPF_CORE_READ(exe, f_inode, i_nlink);
 		r->exe_magic = BPF_CORE_READ(exe, f_inode, i_sb, s_magic);
 		r->exe_mode = BPF_CORE_READ(exe, f_inode, i_mode);
+		r->exe_flags = exe_flags(task, BPF_CORE_READ(exe, f_inode));
 	}
 	start = mm->arg_start;
 	end = mm->arg_end;
@@ -1458,5 +1615,53 @@ SEC("lsm/userns_create")
 int BPF_PROG(on_userns_create, const struct cred *cred)
 {
 	admin_emit(ADMIN_USERNS, cred->euid.val, 0, 0, 0);
+	return 0;
+}
+
+SEC("fexit/nf_nat_setup_info")
+int BPF_PROG(on_nat, struct nf_conn *ct, void *range, int maniptype, unsigned int ret)
+{
+	struct nf_conntrack_tuple *o = &ct->tuplehash[IP_CT_DIR_ORIGINAL].tuple;
+	struct nf_conntrack_tuple *p = &ct->tuplehash[IP_CT_DIR_REPLY].tuple;
+	union nf_inet_addr *was, *now;
+	__u16 was_port, now_port;
+	struct nat_rec *r;
+	struct ring_slot s;
+
+	if (ret != NF_ACCEPT)
+		return 0;
+	if (maniptype == NF_NAT_MANIP_SRC) {
+		was = &o->src.u3;
+		now = &p->dst.u3;
+		was_port = o->src.u.all;
+		now_port = p->dst.u.all;
+	} else {
+		was = &o->dst.u3;
+		now = &p->src.u3;
+		was_port = o->dst.u.all;
+		now_port = p->src.u.all;
+	}
+	if (was->all[0] == now->all[0] && was->all[1] == now->all[1] && was->all[2] == now->all[2] &&
+	    was->all[3] == now->all[3] && was_port == now_port)
+		return 0;
+	bpf_preempt_disable();
+	r = reserve(&ring_nat, CLASS_NAT, NAT_RING, sizeof(*r), &s);
+	if (r) {
+		__builtin_memcpy(r->orig_src, &o->src.u3, 16);
+		__builtin_memcpy(r->orig_dst, &o->dst.u3, 16);
+		__builtin_memcpy(r->reply_src, &p->src.u3, 16);
+		__builtin_memcpy(r->reply_dst, &p->dst.u3, 16);
+		r->orig_sport = bpf_ntohs(o->src.u.all);
+		r->orig_dport = bpf_ntohs(o->dst.u.all);
+		r->reply_sport = bpf_ntohs(p->src.u.all);
+		r->reply_dport = bpf_ntohs(p->dst.u.all);
+		r->netns = ct->ct_net.net->ns.inum;
+		r->family = o->src.l3num;
+		r->proto = o->dst.protonum;
+		r->manip = maniptype;
+		r->pad = 0;
+		commit(&s, &r->h, sizeof(*r), REC_NAT, 0);
+	}
+	bpf_preempt_enable();
 	return 0;
 }
