@@ -28,6 +28,7 @@ const CLOCK: u32 = wire::REC_CLOCK as u32;
 const LOSS: u32 = wire::REC_LOSS as u32;
 const WATCH: u32 = wire::REC_WATCH as u32;
 const CONTAINER: u32 = wire::REC_CONTAINER as u32;
+const HASH: u32 = wire::REC_HASH as u32;
 
 const MASKS: [(u32, &str); 14] = [
     (0x1, "access"),
@@ -95,6 +96,7 @@ struct Decoder {
     watches: HashMap<(u32, u64), String>,
     files: HashMap<FileKey, (types::actor, String)>,
     containers: HashMap<u64, String>,
+    hashes: HashMap<(u32, u64, i64), String>,
 }
 
 struct Obj(String);
@@ -188,6 +190,20 @@ const NAMESPACES: [(u64, &str); 8] = [
     (0x4000_0000, "net"),
 ];
 
+fn hash_rec(rec: &[u8]) -> ((u32, u64, i64), u64, String) {
+    let (ino, dev_id, ctime, size): (u64, u32, i64, u64) = (
+        read(&rec[wire::HDR..]),
+        read(&rec[wire::HDR + 8..]),
+        read(&rec[wire::HDR + 16..]),
+        read(&rec[wire::HDR + 24..]),
+    );
+    let digest: String = rec[wire::HDR + 32..wire::HDR + 64]
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    ((dev_id, ino, ctime), size, digest)
+}
+
 fn container_json(rec: &[u8]) -> (u64, String) {
     let (cgroup, flags): (u64, u8) = (read(&rec[wire::HDR..]), rec[wire::HDR + 8]);
     let text = String::from_utf8_lossy(&rec[wire::HDR + 16..]);
@@ -237,6 +253,10 @@ impl Decoder {
                     i128::from(realtime / 1_000_000) - i128::from(boottime / 1_000_000);
             }
             META => self.hz = u64::from(read::<u32>(&rec[wire::HDR + 4..])),
+            HASH => {
+                let (key, _, digest) = hash_rec(rec);
+                self.hashes.insert(key, digest);
+            }
             CONTAINER => {
                 let (cgroup, json) = container_json(rec);
                 self.containers.insert(cgroup, json);
@@ -334,6 +354,15 @@ impl Decoder {
                                 ..usize::from(boot_len) + usize::from(host_len)],
                         ),
                     )
+            }
+            HASH => {
+                let ((dev_id, ino, ctime), size, digest) = hash_rec(rec);
+                Obj::new("hash", ts)
+                    .str("dev", &dev(dev_id))
+                    .num("ino", ino)
+                    .num("ctime", ctime)
+                    .num("size", size)
+                    .str("sha256", &digest)
             }
             CONTAINER => {
                 let (cgroup, json) = container_json(rec);
@@ -505,6 +534,12 @@ impl Decoder {
             .str("exe_mode", &format!("{:o}", r.exe_mode))
             .num("exe_nlink", r.exe_nlink)
             .str("exe_fs", &fs_name(r.exe_magic))
+            .str(
+                "sha256",
+                self.hashes
+                    .get(&(r.exe_dev, r.exe_ino, r.exe_ctime))
+                    .map_or("", String::as_str),
+            )
             .str(
                 "tty",
                 &if r.tty == 0 {

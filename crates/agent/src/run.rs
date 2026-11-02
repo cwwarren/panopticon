@@ -17,6 +17,7 @@ use libbpf_rs::{Iter, Link, MapCore, MapFlags, ProgramInput};
 
 use crate::bpf::{AgentSkel, AgentSkelBuilder, types};
 use crate::container;
+use crate::hash::{self, Hasher};
 use crate::wire;
 
 static STOP: AtomicBool = AtomicBool::new(false);
@@ -98,7 +99,7 @@ struct Ring {
 }
 
 impl Ring {
-    fn drain(&mut self, out: &mut Vec<u8>) {
+    fn drain(&mut self, out: &mut Vec<u8>, hashes: &mut Hasher) {
         let head =
             unsafe { AtomicU64::from_ptr(&raw mut (*self.ctl).head) }.load(Ordering::Acquire);
         while self.tail < head {
@@ -113,11 +114,14 @@ impl Ring {
             );
             let start = out.len();
             out.extend_from_slice(unsafe { std::slice::from_raw_parts(rec, len as usize) });
-            if out[start + 2] == types::rec_type::REC_CGROUP.0 as u8 {
+            let ty = out[start + 2];
+            if ty == types::rec_type::REC_CGROUP.0 as u8 {
                 let r: types::cgroup_rec = wire::read(&out[start..]);
                 let body = &out[start + size_of::<types::cgroup_rec>()..];
                 let path = String::from_utf8_lossy(&body[..usize::from(r.path_len)]).into_owned();
                 container::push(out, r.h.jiffies, r.id, &path);
+            } else if ty == types::rec_type::REC_EXEC.0 as u8 {
+                request_hash(hashes, &out[start..]);
             }
             self.tail += len;
             self.records += 1;
@@ -181,7 +185,8 @@ pub fn run(out_path: &str, poll: Duration) {
     let inotify = watch(&mut buf, jiffies);
     watch_sockets(&skel, &mut buf, jiffies);
     push_cgroups(&mut buf, jiffies, Path::new("/sys/fs/cgroup"), "");
-    push_snapshot(&skel, &mut buf);
+    let mut hashes = Hasher::new();
+    push_snapshot(&skel, &mut buf, &mut hashes);
     out.write_all(&buf).unwrap();
     buf.clear();
     eprintln!("ready");
@@ -191,9 +196,10 @@ pub fn run(out_path: &str, poll: Duration) {
     loop {
         let stop = STOP.load(Ordering::Relaxed);
         for ring in &mut rings {
-            ring.drain(&mut buf);
+            ring.drain(&mut buf, &mut hashes);
         }
         drain_inotify(inotify);
+        hashes.collect(&mut buf);
         if stop || last_clock.elapsed() >= Duration::from_secs(1) {
             jiffies = push_clock(&skel, &mut buf);
             for ring in &mut rings {
@@ -213,6 +219,7 @@ pub fn run(out_path: &str, poll: Duration) {
         thread::sleep(poll);
     }
     report(&rings, nclasses, coalesced);
+    eprintln!("hash: dropped={}", hashes.dropped);
 }
 
 fn map_rings(skel: &AgentSkel, ncpus: usize, nclasses: usize) -> Vec<Ring> {
@@ -441,7 +448,18 @@ fn watch_sockets(skel: &AgentSkel, buf: &mut Vec<u8>, jiffies: u64) {
     }
 }
 
-fn push_snapshot(skel: &AgentSkel, buf: &mut Vec<u8>) {
+fn request_hash(hashes: &mut Hasher, rec: &[u8]) {
+    let r: types::exec_rec = wire::read(rec);
+    let path = &rec[size_of::<types::exec_rec>()..][..usize::from(r.path_len)];
+    let key = hash::Key {
+        dev: r.exe_dev,
+        ino: r.exe_ino,
+        ctime: r.exe_ctime,
+    };
+    hashes.request(key, r.pid, path, r.h.jiffies);
+}
+
+fn push_snapshot(skel: &AgentSkel, buf: &mut Vec<u8>, hashes: &mut Hasher) {
     let mut raw = Vec::new();
     Iter::new(skel.links.snapshot.as_ref().unwrap())
         .unwrap()
@@ -462,10 +480,12 @@ fn push_snapshot(skel: &AgentSkel, buf: &mut Vec<u8>) {
         off += usize::from(r.h.len);
         r.path_len = u16::try_from(path.len()).unwrap();
         r.h.len = u16::try_from(len).unwrap();
+        let start = buf.len();
         buf.extend_from_slice(wire::bytes_of(&r));
         buf.extend_from_slice(path);
         buf.extend_from_slice(argv);
         buf.resize(buf.len() + len - fixed - path.len() - argv.len(), 0);
+        request_hash(hashes, &buf[start..]);
     }
 }
 

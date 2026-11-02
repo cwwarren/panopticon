@@ -3,6 +3,7 @@ mod bpf {
 }
 mod container;
 mod decode;
+mod hash;
 mod run;
 mod wire;
 
