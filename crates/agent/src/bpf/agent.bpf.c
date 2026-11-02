@@ -800,106 +800,77 @@ static __always_inline bool udp_seen(struct udp_meta *m, const __u64 *addr, __u1
 	return false;
 }
 
-static __always_inline void udp_emit(struct sock *sk, struct msghdr *msg, int ret, __u8 family, const __u64 *addr,
+static __always_inline void udp_emit(struct sk_buff *skb, __u8 family, const __u64 *saddr, const __u64 *daddr,
 				     __u16 port)
 {
+	struct sock *sk = skb->sk;
 	bool dns = port == bpf_htons(DNS_PORT), seen;
 	struct udp_meta *m;
 	struct sock_rec *r;
 	struct ring_slot s;
 	__u8 flags = 0, slot;
-	__u32 plen = 0;
+	__u32 plen = 0, off = 0;
+	__u64 head;
 
 	m = bpf_sk_storage_get(&udp_meta, sk, 0, BPF_SK_STORAGE_GET_F_CREATE);
 	if (!m)
 		return;
-	seen = udp_seen(m, addr, port);
+	seen = udp_seen(m, daddr, port);
 	if (!dns && (seen || m->distinct >= UDP_CAP))
 		return;
 	if (!seen) {
 		slot = m->next & (UDP_SEEN - 1);
-		m->seen[slot].addr[0] = addr[0];
-		m->seen[slot].addr[1] = addr[1];
+		m->seen[slot].addr[0] = daddr[0];
+		m->seen[slot].addr[1] = daddr[1];
 		m->seen[slot].port = port;
 		m->next = slot + 1;
 		if (m->distinct < UDP_CAP && ++m->distinct == UDP_CAP)
 			flags |= FLAG_SATURATED;
 	}
-	if (dns)
+	if (dns) {
 		m->dns = 1;
+		off = skb->transport_header + sizeof(struct udphdr);
+		if (skb->tail > off)
+			plen = skb->tail - off;
+		if (plen > DNS_MAX)
+			plen = DNS_MAX;
+	}
 
 	bpf_preempt_disable();
 	r = reserve(&ring_net, CLASS_NET, NET_RING, SOCK_MAX, &s);
 	if (r) {
 		fill_sock(r, sk);
 		r->family = family;
-		if (family == AF_INET) {
-			__builtin_memset(r->saddr, 0, 16);
-			*(__u32 *)r->saddr = sk->__sk_common.skc_rcv_saddr;
-		}
-		__builtin_memcpy(r->daddr, addr, 16);
+		__builtin_memcpy(r->saddr, saddr, 16);
+		__builtin_memcpy(r->daddr, daddr, 16);
 		r->dport = bpf_ntohs(port);
-		if (dns && msg->msg_iter.iter_type == ITER_UBUF) {
-			plen = ret;
-			if (plen > DNS_MAX)
-				plen = DNS_MAX;
-			barrier_var(plen);
-			if (bpf_probe_read_user(r->payload, plen, msg->msg_iter.ubuf))
-				plen = 0;
-		}
+		barrier_var(plen);
+		if (plen && (bpf_core_read(&head, sizeof(head), &skb->head) ||
+			     bpf_probe_read_kernel(r->payload, plen, (void *)(head + off))))
+			plen = 0;
 		r->payload_len = plen;
 		commit(&s, &r->h, sizeof(*r) + plen, dns ? REC_DNS_QUERY : REC_UDP_SEND, flags);
 	}
 	bpf_preempt_enable();
 }
 
-SEC("fexit/udp_sendmsg")
-int BPF_PROG(on_udp_send, struct sock *sk, struct msghdr *msg, size_t len, int ret)
+SEC("fentry/udp_send_skb")
+int BPF_PROG(on_udp_send, struct sk_buff *skb, struct flowi4 *fl4, struct inet_cork *cork)
 {
-	struct sockaddr_in sin = {};
-	void *name = msg->msg_name;
-	__u32 daddr = sk->__sk_common.skc_daddr;
-	__u16 dport = sk->__sk_common.skc_dport;
-	__u64 addr[2] = {};
+	__u64 saddr[2] = { fl4->saddr }, daddr[2] = { fl4->daddr };
 
-	barrier_var(daddr);
-	barrier_var(dport);
-	if (ret < 0)
-		return 0;
-	if (name) {
-		bpf_probe_read_kernel(&sin, sizeof(sin), name);
-		if (sin.sin_family != AF_INET)
-			return 0;
-		daddr = sin.sin_addr.s_addr;
-		dport = sin.sin_port;
-	}
-	addr[0] = daddr;
-	udp_emit(sk, msg, ret, AF_INET, addr, dport);
+	udp_emit(skb, AF_INET, saddr, daddr, fl4->uli.ports.dport);
 	return 0;
 }
 
-SEC("fexit/udpv6_sendmsg")
-int BPF_PROG(on_udp6_send, struct sock *sk, struct msghdr *msg, size_t len, int ret)
+SEC("fentry/udp_v6_send_skb")
+int BPF_PROG(on_udp6_send, struct sk_buff *skb, struct flowi6 *fl6, struct inet_cork *cork)
 {
-	struct sockaddr_in6 sin6 = {};
-	void *name = msg->msg_name;
-	__u16 dport = sk->__sk_common.skc_dport;
-	__u64 addr[2] = {};
+	__u64 saddr[2], daddr[2];
 
-	barrier_var(dport);
-	if (ret < 0)
-		return 0;
-	bpf_probe_read_kernel(addr, sizeof(addr), &sk->__sk_common.skc_v6_daddr);
-	if (name) {
-		bpf_probe_read_kernel(&sin6, sizeof(sin6), name);
-		if (sin6.sin6_family != AF_INET6)
-			return 0;
-		__builtin_memcpy(addr, &sin6.sin6_addr, sizeof(addr));
-		dport = sin6.sin6_port;
-	}
-	if (addr[0] == 0 && (__u32)addr[1] == bpf_htonl(0xffff))
-		return 0;
-	udp_emit(sk, msg, ret, AF_INET6, addr, dport);
+	__builtin_memcpy(saddr, &fl6->saddr, sizeof(saddr));
+	__builtin_memcpy(daddr, &fl6->daddr, sizeof(daddr));
+	udp_emit(skb, AF_INET6, saddr, daddr, fl6->uli.ports.dport);
 	return 0;
 }
 

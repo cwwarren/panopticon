@@ -169,7 +169,7 @@ has its own ring on every CPU.
 | Class | Hooks | Context | Records |
 |---|---|---|---|
 | proc | `tp_btf/sched_process_fork` (state only), `lsm.s/bprm_committed_creds`, `tp_btf/sched_process_exit`, `fexit/audit_set_loginuid`, `tp_btf/cgroup_mkdir` | process | exec, exit, login, cgroup |
-| net | `fexit/tcp_v4_connect`, `fexit/tcp_v6_connect`, `fexit/inet_csk_accept`, `fexit/inet_listen`, `fexit/inet_bind` and `inet6_bind` (datagram sockets), `fexit/udp_sendmsg`, `fexit/udpv6_sendmsg`, `fentry/skb_consume_udp`, `fexit/packet_create`, `fexit/raw_sk_init`, `fexit/rawv6_init_sk`, `lsm/unix_stream_connect` | process | connect, accept, listen, UDP bind, UDP first send, DNS query, DNS answer, raw socket, unix connect |
+| net | `fexit/tcp_v4_connect`, `fexit/tcp_v6_connect`, `fexit/inet_csk_accept`, `fexit/inet_listen`, `fexit/inet_bind` and `inet6_bind` (datagram sockets), `fentry/udp_send_skb`, `fentry/udp_v6_send_skb`, `fentry/skb_consume_udp`, `fexit/packet_create`, `fexit/raw_sk_init`, `fexit/rawv6_init_sk`, `lsm/unix_stream_connect` | process | connect, accept, listen, UDP bind, UDP first send, DNS query, DNS answer, raw socket, unix connect |
 | file | `fentry/inotify_handle_inode_event` (our group only), `iter/bpf_map_elem` on the coalescing map | process | file access or change, repeat count |
 | admin | LSM hooks for module and kexec loads, BPF loads, ptrace access in attach mode, traceme, uid/gid/capability changes, mount/move_mount/umount/pivot_root, settime, user namespaces, signals (`task_kill`), secure anonymous inodes, access to the agent's own BPF objects (`bpf_map`, `bpf_prog`); `fentry/proc_sys_write`; `fexit/create_new_namespaces` and the eight `*ns_install` callbacks | process | admin operation |
 | nat | `fexit/nf_nat_setup_info` (`nf_nat` module), in its own BPF object | process or softirq | NAT translation |
@@ -234,7 +234,8 @@ cgroup id, inode). The consumer drains rings one after another, so stream order 
 the decoder indexes identities in a first pass and emits in a second.
 
 Userspace adds its own record types to the same stream: meta (host, boot id, CPU count, HZ), clock,
-loss, watch (each marked path or watched socket with its dev and inode), container and hash.
+loss, miss (a program's recursion misses), watch (each marked path or watched socket with its dev and
+inode), container and hash.
 
 Time is jiffies (1 ms at `HZ=1000`). Userspace emits a clock record (jiffies, `CLOCK_REALTIME`,
 `CLOCK_BOOTTIME`) every second, and the decoder converts; the boottime reference converts kernel start
@@ -338,17 +339,26 @@ namespace, process key, image key, cgroup, time.
 - TCP out: `fexit/tcp_v4_connect` and `tcp_v6_connect`, after the source port is assigned.
 - TCP in: `fexit/inet_csk_accept`, in the accepting process.
 - Listen: `fexit/inet_listen`.
-- UDP over IPv4 and IPv6: `fexit/udp_sendmsg` and `fexit/udpv6_sendmsg` share one path. Each
-  destination (16-byte address and port) is checked against the socket's last 4 in socket-local
-  storage, and a new one emits a record. After 16 records the socket is flagged saturated and reports
-  nothing more (DNS queries are always recorded and do not move the count past 16). The table is
-  updated without a lock, so two threads sending on one socket can exceed 16 by a few records. Its own
-  tuple joins the rest of its flows. A send to an IPv4-mapped address is recorded
-  once, by the IPv4 hook. `connect()` on UDP without traffic is not recorded because no flow follows it.
-- DNS over IPv4 and IPv6: every query payload when the destination port is 53; the socket is tagged,
-  and answers are copied from `skb_consume_udp` for tagged sockets only. Covers glibc and musl stub
-  resolvers, systemd-resolved's stub, Docker's resolver paths and CoreDNS. Not covered: DoH, DoT, DoQ,
-  TCP port 53, systemd-resolved's varlink clients.
+- UDP over IPv4 and IPv6: `fentry/udp_send_skb` and `fentry/udp_v6_send_skb` share one path. Both
+  the plain and the corked send path build the datagram and call them, out of line (bpftrace on this
+  host: 530,721 calls for 530,722 `udp_sendmsg` returns; the one missing send failed before building
+  an skb). Addresses come from the route's flow, so an unconnected socket records its real source
+  address instead of `0.0.0.0`. A datagram is recorded when it is handed to IP; one a local firewall
+  then drops is still recorded. Each destination (16-byte address and port) is checked against the
+  socket's last 4 in socket-local storage, and a new one emits a record. After 16 records the socket
+  is flagged saturated and reports nothing more (DNS queries are always recorded and do not move the
+  count past 16). The table is updated without a lock, so two threads sending on one socket can
+  exceed 16 by a few records. Its own tuple joins the rest of its flows. A send to an IPv4-mapped
+  address goes through the IPv4 function and is recorded once. `connect()` on UDP without traffic
+  is not recorded because no flow follows it.
+- DNS over IPv4 and IPv6: every query payload when the destination port is 53, copied from the
+  datagram's linear data in the skb, which the sender can no longer change. The first version read
+  the sender's buffer after `udp_sendmsg` returned: a thread that rewrote the name 0–3 µs into each
+  send (`bench/results/experiments/dns_race.sh`, 20,000 queries) put `evil.com` on the wire 1,429
+  times and in the records 15,498 times. Reading the skb, the counts are equal (1,413 and 1,413). The
+  socket is tagged, and answers are copied from `skb_consume_udp` for tagged sockets only. Covers
+  glibc and musl stub resolvers, systemd-resolved's stub, Docker's resolver paths and CoreDNS. Not
+  covered: DoH, DoT, DoQ, TCP port 53, systemd-resolved's varlink clients.
 - Raw and packet sockets: `fexit/packet_create`, `fexit/raw_sk_init` and `fexit/rawv6_init_sk`, the
   family constructors, so no other socket creation pays. Kernel control sockets are excluded.
 - Unix stream connects to container runtime sockets (docker, containerd, k3s containerd, CRI-O,
@@ -526,11 +536,10 @@ which the collector sees within a second.
 | 2026-11-02 | Open files to hash with `O_PATH` first and reopen only regular files | `open` on a device node runs its driver (a watchdog arms on open); a container with default `CAP_MKNOD` can place one in its watched `etc` |
 | 2026-11-02 | Key watch state by watch descriptor and drop it on `IN_IGNORED` from the BPF hook | Path and growth maps grew with every container start; the inotify queue can overflow during a flood, the BPF hook sees every removal |
 | 2026-11-02 | Emit a container record only when the bundle's `linux.cgroupsPath` names the cgroup | Previous build: a cgroup an unprivileged user created in `user@1000.service` with a k3s container's id was attributed to that pod |
+| 2026-11-02 | UDP sends and DNS query payloads from `fentry/udp_send_skb` and `udp_v6_send_skb`, never from the sender's buffer | Reading the buffer after `udp_sendmsg`: 15,498 `evil.com` records for 1,429 on the wire under a 0–3 µs rewrite race; from the skb: 1,451 and 1,451 |
 
 ## Open questions
 
-- Cost of the remaining fexit trampolines. `udp_sendmsg` uses its return value only to skip failed
-  sends and size the DNS payload; `fentry` would avoid the call-through. Measure before switching.
 - Output path: batch size, compression, transport to the collector.
 - NAT module pinning: whether holding `nf_nat` loaded is acceptable on hosts that unload it.
 - Environment variables: whether an idle-priority read of `/proc/<pid>/environ` for long-lived
