@@ -92,7 +92,7 @@ def annotate_pano(r, log):
     r["drop_pct"] = 100 * drops / total if total else 0.0
     name, ops = r["name"], r.get("ops")
     if name.startswith("exec"):
-        r["delivered_pct"] = 100 * proc / ops
+        r["delivered_pct"] = 100 * proc / (2 * ops)
     elif name.startswith("connect"):
         r["delivered_pct"] = 100 * net / (2 * ops)
     elif name.startswith("open-shadow"):

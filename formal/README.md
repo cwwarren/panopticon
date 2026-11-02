@@ -31,11 +31,14 @@ maps, `udp_emit()` shared by IPv4 and IPv6, `file_window` as a load-time constan
 are to Linux v7.0 (`github.com/torvalds/linux`, tag `v7.0`) unless marked as the host's Ubuntu
 `7.0.0-42` headers or config.
 
-Two later commits change code next to the models without changing what they model. `2e64251` moves
-the UDP hooks from `fexit/udp_sendmsg` and `fexit/udpv6_sendmsg` to `fentry/udp_send_skb` and
+Later commits change code next to the models without changing what they model. `2e64251` moves the
+UDP hooks from `fexit/udp_sendmsg` and `fexit/udpv6_sendmsg` to `fentry/udp_send_skb` and
 `fentry/udp_v6_send_skb` and reads DNS payloads from the skb; `udp_seen()` and the dedup and
 saturation logic in `udp_emit()` are unchanged, and K13 still holds because the uncorked path reaches
-`udp_send_skb` without the socket lock. `0e9a541` changes the sysctl hook, which no model covers.
+`udp_send_skb` without the socket lock. `0e9a541` changes the sysctl hook, which no model covers. The
+NAT commit after it moves `on_nat` from `fexit/nf_nat_setup_info` to `fentry/__nf_conntrack_confirm`;
+it is still one tracing program that runs in task and softirq context and calls `reserve()` and
+`commit()` the same way, so the producer models and the recursion-guard finding apply unchanged.
 
 ## Files
 

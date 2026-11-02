@@ -126,8 +126,10 @@ overhead() {
   for rep in $(seq "$REPS"); do
     for cond in "${CONDITIONS[@]}"; do
       start_agent "$cond" "overhead-$cond-$rep"
+      sleep "${SETTLE:-0}"
       for w in "${WORKLOADS[@]}"; do
         read -r name workload threads path <<<"$w"
+        [[ -n ${ONLY:-} && ! $name =~ $ONLY ]] && continue
         local t0 c0 result
         t0=$(now)
         c0=$(agent_ticks)
@@ -246,7 +248,8 @@ bpfstats() {
            progs: [.[] | select(.id as $id | $base | index($id) | not)
                    | {id, name, type,
                       run_cnt: ((.run_cnt // 0) - ($b[.id | tostring].run_cnt // 0)),
-                      run_time_ns: ((.run_time_ns // 0) - ($b[.id | tostring].run_time_ns // 0))}
+                      run_time_ns: ((.run_time_ns // 0) - ($b[.id | tostring].run_time_ns // 0)),
+                      recursion_misses: ((.recursion_misses // 0) - ($b[.id | tostring].recursion_misses // 0))}
                    | select(.run_cnt > 0)]}' >>"$OUT/bpfstats.jsonl"
       sleep 2
     done

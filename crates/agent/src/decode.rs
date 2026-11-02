@@ -550,7 +550,14 @@ impl Decoder {
             NAT => {
                 let r: types::nat_rec = read(rec);
                 Obj::new("nat", ts)
-                    .str("manip", if r.manip == 0 { "snat" } else { "dnat" })
+                    .str(
+                        "manip",
+                        match r.manip {
+                            1 => "snat",
+                            2 => "dnat",
+                            _ => "snat+dnat",
+                        },
+                    )
                     .num("proto", r.proto)
                     .str(
                         "orig",

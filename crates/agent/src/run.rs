@@ -25,7 +25,7 @@ use crate::wire;
 
 static STOP: AtomicBool = AtomicBool::new(false);
 
-const NAT_BTF: &str = "/sys/kernel/btf/nf_nat";
+const NAT_BTF: &str = "/sys/kernel/btf/nf_conntrack";
 const READ: u32 = libc::IN_OPEN;
 const CHANGE: u32 = libc::IN_CLOSE_WRITE
     | libc::IN_MODIFY

@@ -172,7 +172,7 @@ has its own ring on every CPU.
 | net | `fexit/tcp_v4_connect`, `fexit/tcp_v6_connect`, `fexit/inet_csk_accept`, `fexit/inet_listen`, `fexit/inet_bind` and `inet6_bind` (datagram sockets), `fentry/udp_send_skb`, `fentry/udp_v6_send_skb`, `fentry/skb_consume_udp`, `fexit/packet_create`, `fexit/raw_sk_init`, `fexit/rawv6_init_sk`, `lsm/unix_stream_connect` | process | connect, accept, listen, UDP bind, UDP first send, DNS query, DNS answer, raw socket, unix connect |
 | file | `fentry/inotify_handle_inode_event` (our group only), `iter/bpf_map_elem` on the coalescing map | process | file access or change, repeat count |
 | admin | LSM hooks for module and kexec loads, BPF loads, ptrace access in attach mode, traceme, uid/gid/capability changes, mount/move_mount/umount/pivot_root, settime, user namespaces, signals (`task_kill`), secure anonymous inodes, access to the agent's own BPF objects (`bpf_map`, `bpf_prog`); `fentry/proc_sys_write`; `fexit/create_new_namespaces` and the eight `*ns_install` callbacks | process | admin operation |
-| nat | `fexit/nf_nat_setup_info` (`nf_nat` module), in its own BPF object | process or softirq | NAT translation |
+| nat | `fentry/__nf_conntrack_confirm` (`nf_conntrack` module), in its own BPF object | process or softirq | NAT translation |
 
 Fork produces no records. Process exit produces one record when the last thread exits.
 
@@ -365,22 +365,29 @@ namespace, process key, image key, cgroup, time.
   podman): `lsm/unix_stream_connect`, filtered by the target socket's inode. This hook runs for every
   unix stream connect, 19 ns each; nothing in the kernel indexes unix connects by target, so this is the
   one new cost on unrelated activity.
-- NAT: `fexit/nf_nat_setup_info` in the `nf_nat` module; one record per call whose own manipulation
-  changed the tuple (SNAT compares the original source with the reply destination, DNAT the original
-  destination with the reply source): original and reply tuples, protocol, network namespace. No
-  actor: the hook also runs in softirq context, where the current task is unrelated; the original tuple
-  joins the record to the container's connect record. Docker egress `172.17.0.2:54560 -> 1.1.1.1:80`
-  is recorded with reply `1.1.1.1:80 -> 192.168.1.18:54560`. Agents start at boot, often before docker
-  or k3s loads `nf_nat`, and an fexit target is fixed when the program loads. So the program lives in
-  its own BPF object (`nat.bpf.c`) that reuses the main object's nat ring and control maps; the agent
-  loads it at start if `/sys/kernel/btf/nf_nat` exists and otherwise checks once per second.
-  Verified by hiding that file in a private mount namespace and creating it 3 s after start: the
-  program attached on the next check and docker egress was recorded. A failed load (module BTF
-  appears before the module's init finishes) is logged and retried on the next check. A program
-  loaded after start is not in the frozen set of the agent's own program ids. While attached it
-  holds a reference that keeps `nf_nat` from being unloaded. Cilium with BPF masquerade keeps NAT state
-  in its own map (`cilium_snat_v4_external`) and needs a version-pinned reader; not testable on this
-  host.
+- NAT: `fentry/__nf_conntrack_confirm` in the `nf_conntrack` module, which runs once per new
+  connection after every NAT binding for it is in place. The program reads the connection's status
+  and returns unless `IPS_SRC_NAT` or `IPS_DST_NAT` is set; otherwise it emits the final original and
+  reply tuples, protocol, network namespace, and which translations were applied. No actor: the hook
+  also runs in softirq context, where the current task is unrelated; the original tuple joins the
+  record to the container's connect record. Docker egress `172.17.0.2:47612 -> 1.1.1.1:80` is
+  recorded as SNAT with reply `1.1.1.1:80 -> 192.168.1.18:47612`; a k3s Service connection
+  `192.168.1.18:51582 -> 10.43.164.178:8765` as SNAT and DNAT with reply
+  `10.42.1.45:8765 -> 10.42.0.224:40502`, which names the pod behind the Service. The first version
+  hooked `fexit/nf_nat_setup_info`, which on a host with docker or k3s runs twice for every new
+  connection, loopback included, to set up null bindings (bpftrace: 338,612 calls for 169,306
+  connections, of which 5 were translated). The confirm hook runs once per connection with one field
+  read (8.4–9.3 ns per run in `bpf_stats`) and no call-through. Agents start at boot, often before
+  docker or k3s loads the conntrack modules, and a tracing target is fixed when the program loads.
+  So the program lives in its own BPF object (`nat.bpf.c`) that reuses the main object's nat ring and
+  control maps; the agent loads it at start if `/sys/kernel/btf/nf_conntrack` exists and otherwise
+  checks once per second. Verified by hiding that file in a private mount namespace and creating it
+  3 s after start: the program attached on the next check and docker egress was recorded. A failed
+  load (module BTF appears before the module's init finishes) is logged and retried on the next
+  check. A program loaded after start is not in the frozen set of the agent's own program ids. While
+  attached it holds a reference that keeps `nf_conntrack` from being unloaded. Cilium with BPF
+  masquerade keeps NAT state in its own map (`cilium_snat_v4_external`) and needs a version-pinned
+  reader; not testable on this host.
 - UDP binds: `fexit/inet_bind` and `inet6_bind` for datagram sockets, on success. TCP servers are
   covered by listen.
 
@@ -544,7 +551,8 @@ costs nothing measurable (52.10 against 52.29 ns per emitting `getppid`).
 | 2026-11-02 | No rare-class ring sharing | Saves a few MB, adds a second code path |
 | 2026-11-02 | Jiffies, not nanosecond timestamps | ktime costs ~8 ns of an 11 ns event; 1 ms is enough to join flows |
 | 2026-11-02 | Sensitive files gated by fsnotify marks | 0 ns per unrelated open vs +12 ns for any `file_open` hook; catches io_uring |
-| 2026-11-02 | NAT from `nf_nat_setup_info`, not ctnetlink | +46 ns/conn vs +1.53 µs/conn |
+| 2026-11-02 | NAT from the kernel's conntrack, not ctnetlink | +46 ns/conn for an `nf_nat_setup_info` hook vs +1.53 µs/conn for ctnetlink |
+| 2026-11-02 | NAT at `__nf_conntrack_confirm`, emitting only for connections with NAT status | `nf_nat_setup_info` runs twice per new connection on a docker or k3s host, loopback included (338,612 calls for 169,306 connections, 5 translated); confirm runs once, 8.4–9.3 ns |
 | 2026-11-02 | Kernel ≥ 6.15 only | Needed for preempt kfuncs and acquire/release; no fallback paths |
 | 2026-11-02 | libbpf (C programs) with libbpf-rs userspace | Most mature CO-RE; skeleton generates Rust record types |
 | 2026-11-02 | Exec record carries the previous image key | Attributes execs by fork-only children without fork records |
@@ -568,7 +576,7 @@ costs nothing measurable (52.10 against 52.29 ns per emitting `getppid`).
 ## Open questions
 
 - Output path: batch size, compression, transport to the collector.
-- NAT module pinning: whether holding `nf_nat` loaded is acceptable on hosts that unload it.
+- Conntrack module pinning: whether holding `nf_conntrack` loaded is acceptable on hosts that unload it.
 - Environment variables: whether an idle-priority read of `/proc/<pid>/environ` for long-lived
   processes is worth its blind spot for short-lived ones.
 
@@ -652,6 +660,28 @@ floor there is the trampoline plus the record write.
 - Coalesced counts were reported only when the key fired again, so the last window's count was lost
   (424 of 3.4M opens). With the flush iterator, a 2-second flood of 3,276,638 opens produced 3
   records and 3,276,635 repeat counts.
+
+### Found by adversarial tests
+
+Each was fixed; details are in the sections named.
+
+- A user's symlink at a listed home path (`~/.aws -> /tmp/x`) redirected a read mark to any host
+  directory, a link loop made the agent panic at startup, and a FUSE mount whose server never answers
+  hung it. Reproduced on the previous build (Credentials).
+- A cgroup an unprivileged user created in their delegated subtree with a k3s container's id was
+  attributed to that pod. Reproduced (Containers).
+- A DNS query name rewritten by another thread after the send was recorded instead of the name on the
+  wire: 15,498 against 1,429 of 20,000. Reproduced (Network attribution).
+- A sysctl value rewritten before the kernel's copy was recorded instead of the applied value: 129 of
+  315. Reproduced (Admin operations).
+- Mark removals produced file records with inode 0, and watch state grew with every container start.
+  Reproduced (Credentials).
+- From the code: the hash worker opened changed files with `O_RDONLY | O_NONBLOCK`, which runs a
+  device driver's `open` (a device node moved into a container's watched `etc`), and opened an exited
+  program's recorded path without `O_NONBLOCK`, so a FIFO there stopped all hashing. The fixed path
+  opens with `O_PATH` first; strace shows a device node is never reopened (Credentials).
+- From the formal model: recursion misses were not reported, the final drain ran before detaching,
+  the UDP destination count wrapped, and the coalescing window test underflowed (Formal model).
 
 ### Next
 
