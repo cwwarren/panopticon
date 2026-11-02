@@ -892,9 +892,22 @@ fn push_loss(ring: &mut Ring, buf: &mut Vec<u8>, jiffies: u64) {
     }
 }
 
+// bpf_seq_read collects iterator output in a 32 KiB buffer. An element whose output overflows it is
+// run again in the next read, after its count was already swapped out, so reads stay at half that.
+const ITER_READ: usize = 16 << 10;
+
 fn push_repeats(flush: &Link, buf: &mut Vec<u8>) -> u64 {
     let start = buf.len();
-    Iter::new(flush).unwrap().read_to_end(buf).unwrap();
+    let mut iter = Iter::new(flush).unwrap();
+    loop {
+        let len = buf.len();
+        buf.resize(len + ITER_READ, 0);
+        let n = iter.read(&mut buf[len..]).unwrap();
+        buf.truncate(len + n);
+        if n == 0 {
+            break;
+        }
+    }
     buf[start..]
         .as_chunks::<{ size_of::<types::file_repeat_rec>() }>()
         .0
