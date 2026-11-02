@@ -215,10 +215,13 @@ Fork produces no records. Process exit produces one record when the last thread 
   running `SCHED_IDLE` with idle I/O priority. It hashes `/proc/<pid>/exe` (the exact inode even if the
   path was replaced or deleted), falling back to the recorded path with the key verified, and drops the
   pages it read (`POSIX_FADV_DONTNEED`: a 200 MB binary left 0 bytes resident, 190.8 MB without). The
-  startup snapshot's executables go to a second idle thread that exits when done, so live execs and
-  file changes never wait behind it: this host's 91 running binaries (4.07 GB) take about 25 s, and a
-  file changed 3 s after start was hashed in the same run. The set of keys already queued holds at most
-  65,536 entries and is cleared when full, which costs a repeated hash, not memory growth.
+  startup snapshot's executables go to a second idle thread that exits when done and works at most a
+  quarter of the time (after each 256 KiB chunk it sleeps three times as long as the chunk took), so
+  live execs and file changes never wait behind it and co-running work sees less cache and SMT
+  contention: this host's running binaries (4.2 GB) took 20–40 s at a peak of 0.10 cores, against
+  0.22 unthrottled, and a file changed 3 s after start was hashed in the same run. The set of keys
+  already queued holds at most 65,536 entries and is cleared when full, which costs a repeated hash,
+  not memory growth.
 
 Volume is one record per exec and per process exit, plus the one-time snapshot.
 
@@ -291,7 +294,7 @@ prototype uses 256 KiB per CPU for proc and net and 64 KiB for file, admin and n
 
 ### Userspace
 
-One thread:
+The main thread:
 
 - Poll all rings; append whole records to an output buffer. The only record bytes it reads are the
   header and two record types: a cgroup record triggers container resolution, an exec record queues a
@@ -305,7 +308,43 @@ One thread:
 - At shutdown the agent first detaches every program, waits one poll interval for invocations in
   flight, and only then drains the rings and reads the iterator, so nothing committed is left behind.
 - Collect finished hashes from the hashing worker.
-- Write the buffer to the sink.
+- Hand the buffer to the sink: a file (`panopticon run <file>`, the binary stream `panopticon decode`
+  reads) or an OpenTelemetry collector (`panopticon run http://collector:4318`, see Output).
+
+### Output
+
+`panopticon run http://collector:4318` ships the stream as OTLP/HTTP logs with JSON encoding
+(`POST /v1/logs`), which any OpenTelemetry Collector accepts. Each record becomes one log record:
+`eventName` `pano.<type>`, `timeUnixNano` from the record's jiffies and the latest clock record, and
+the fields `panopticon decode` prints as typed attributes (`intValue`, `stringValue`, `boolValue`,
+arrays for argv, masks and DNS answers, the container flattened to `container.*`, empty strings and
+false flags left out). Resource attributes: `service.name` `panopticon`, `host.name`,
+`panopticon.boot_id`.
+
+- Encoding: a dedicated thread renders records straight into one buffer. Escaping covers only `"`,
+  `\` and control bytes, integers are formatted by hand, and no JSON or protobuf library is involved.
+  It is the renderer `panopticon decode` uses; `panopticon decode <file> otlp` prints what would be
+  sent. One core encodes 1.69 M records/s (2.08 M/s as plain JSON); an OTLP record averages 710 bytes,
+  2.3 times the plain JSON.
+- Joins: exec and container records index the executable path and container metadata that later
+  records carry. These tables keep two generations of 32,768 entries, and an entry read in the older
+  generation moves to the newer, so memory is bounded and long-running processes keep their
+  enrichment. Hashes are computed after the exec and arrive as their own `pano.hash` records, keyed
+  by dev, inode and ctime.
+- Batching: one POST per second, or at 4 MiB of JSON (the Collector's default limit is 20 MiB). Plain
+  HTTP/1.1 from the standard library, one connection per request, 10 s timeouts. `https://` is not
+  supported: a remote collector sits behind a local one or a proxy.
+- Backpressure: the main thread never waits on the sink. It hands each poll's records to the encoder
+  through a queue bounded at 64 MiB; past that it drops whole batches and counts their records.
+  Transport errors, 408, 429 and 5xx are retried with backoff doubling to 30 s; any other status drops
+  the batch. Every loss is reported in the next delivered batch as a `pano.sink_loss` record with the
+  record count, next to the kernel side's `loss` and `miss` records.
+- Measured against OpenTelemetry Collector v0.164.0 on this host: 717 records sent and 717 parsed,
+  attributes typed. With the collector stopped during a 5 s connect flood (849,755 records), the rings
+  dropped nothing, 600,091 records were delivered once it came back, and 250,666 were reported lost in
+  one `pano.sink_loss` record; the collector counted 600,092. A sustained 170 k records/s (a connect
+  loop) shipped with no loss at 0.12 agent cores, against 0.005 when writing a file, and 43 MB RSS
+  against 33.
 
 ### Containers
 
@@ -421,9 +460,17 @@ Two kinds of inotify marks:
   watch descriptor, which the kernel allocates cyclically, so a reused inode number cannot remove a
   newer entry. A container start and exit leaves both maps at their previous size.
 - Coalescing: the first event per (process key, `self_exec_id`, marked inode, child inode, mask) in a
-  one-second window emits a record; later ones increment a counter in an LRU hash of 4096 keys. A
-  `bpf_map_elem` iterator, read once per second and at shutdown, swaps each counter with zero and
-  emits a repeat record. With `self_exec_id` in the key, a program exec'd by the process gets its own
+  one-second window emits a record; later ones increment a counter in a hash map of up to 16,384
+  keys. A `bpf_map_elem` iterator, read once per second and at shutdown, swaps each counter with zero
+  and emits a repeat record. It deletes a key over two passes so that no increment in flight is lost:
+  a pass that finds the key's window expired marks it dead, and a hook that finds it dead revives it
+  with a new window, its event being that window's record. A pass that still finds the key dead marks
+  it gone, swaps out the count and deletes it; an event that finds a gone key is emitted as a full
+  record and leaves the element alone. A hook re-reads the window start after its increment and, if
+  a pass marked the key in the meantime, swaps out the count and emits it as a repeat record. The map
+  holds only keys with an event in the last three seconds. When the map is full, an event for a new
+  key is emitted as a full record flagged `saturated` (not coalesced) instead of evicting another
+  key's pending count. With `self_exec_id` in the key, a program exec'd by the process gets its own
   record instead of disappearing into the previous program's count.
 - Containers: when a container's cgroup appears, the agent locates its OCI bundle (containerd,
   docker through containerd's `moby` namespace, CRI-O, podman) and marks `etc/shadow` and
@@ -465,11 +512,26 @@ Three quarters of it is the kernel allocating an inotify event that nobody reads
 skip that allocation: `inotify_handle_inode_event` is not error-injectable, so `fmod_ret` cannot
 attach, and fanotify has no BPF hooks. Unlisted files pay nothing.
 
-Limit: with more than 4096 keys active within one second, LRU eviction drops the pending counts of
-evicted keys without a loss record, and because an evicted element is reused at once while another
-CPU may still hold a pointer to it, a count can land on a different key. Every access after an
-eviction still emits a full record. The window test is a signed difference, so an invocation that
-read the clock just before another CPU advanced the key's window counts as inside it.
+Counts are exact: two floods of `/etc/shadow` opens, the second after 2 s idle, 4,850,526 opens in
+all, produced 5 records and 4,850,521 repeat counts, and the key was gone from the map 3 s after its
+last event. 9,000 files created in 0.11 s, more distinct keys than the map holds, produced 288
+records flagged `saturated`; every other event was a record or a ring overrun counted in a loss
+record. 6,000 processes each opening `/etc/shadow` twice produced 6,000 records and 6,000 repeat
+counts, in passes of up to 1,195 repeat records. That depends on reading the iterator 16 KiB at a
+time: the kernel collects iterator output in a 32 KiB buffer and runs an element whose output
+overflows it again, after its count was taken. With reads that grew past 32 KiB, 2 of 3,000 such
+processes lost their repeat count.
+
+Two cases remain, both from the kernel handing a deleted element to the next insert on the CPU that
+deleted it, without a grace period (`htab_elem_free()`, `bpf_mem_cache_free()`). If an interrupt
+stops a hook between its lookup and its read of the window start while the iterator deletes that
+element and an insert for another key reuses it, the hook counts its event under the other key: that
+access has no record and the other key's count is one too high. A hook held between that read and
+its increment while the iterator marks the key dead and then gone loses its event instead: the
+increment lands after the final swap and the reusing insert zeroes it. The first needs an interrupt
+at one instruction while the key is deleted, the second a hold across the passes that mark it;
+neither has been observed. The window test is a signed difference, so an invocation that read the
+clock just before another CPU advanced the key's window counts as inside it.
 
 ### Admin operations
 
@@ -524,7 +586,7 @@ lists the kernel and BPF guarantees each model relies on, with sources.
 |---|---|---|
 | Ring (614,228 states) | No overwrite, no partial read, records contiguous within size + slack, every record consumed, dropped or still in the ring; the producer finishes within `max + 2` steps even if the consumer never runs | Head store without release: partial read. Tail store without release: overwrite. One byte written past `max`: overwrite with every store inside the map value |
 | Nested producers (up to 3,950,593 states) | Busy flag with exchange and atomic drop counters, under task, softirq, hardirq and NMI nesting in any order: no overlapping writes, one commit per reservation, the flag never leaks, exact accounting | No flag: overlap. Non-atomic drop counter: a lost count. A plain load/store flag is safe only for last-in first-out nesting |
-| File coalescing (1,988,080 states with eviction) | Every event is counted once, as a record, a flushed repeat or a pending count; only eviction loses counts | `BPF_ANY` insert loses a pending count without eviction; eviction can move a count to another key |
+| File coalescing (up to 15,740,827 states) | Every event is counted once, as a record, a repeat, a late repeat or a counted ring drop, under its own key, with clock lag, a full map and failed deletes; a key stays in the map less than a window plus two passes after its last window began | Immediate element reuse moves an event to another key and, with clock lag, can wipe a count. The LRU protocol lost counts on eviction |
 | Host safety (1,246,989 states) | Every hook invocation finishes in a bounded number of steps; host threads keep making progress whether the agent runs, stalls or dies; all state stays bounded | A producer that waited for ring space would block the host |
 | UDP dedup (16,693,624 states) | With one sender, records ≤ 16 + DNS queries; a send to a destination outside the last 4 always emits | Two senders on one socket exceed the cap |
 
@@ -534,11 +596,13 @@ context.
 
 Found by the models and fixed in the code: recursion misses were not reported; the final drain ran
 before the programs were detached; the UDP destination count wrapped; the coalescing window test
-underflowed when an invocation spanned a jiffy. Found and documented: the two-sender UDP overshoot,
-eviction moving a count to another key, a one-jiffy lag that can add a record to a window or move
-its start back by a jiffy, and that the shutdown wait is one poll interval, so a program preempted
-before `reserve()` for longer than that could still commit after the final drain. The busy flag
-costs nothing measurable (52.10 against 52.29 ns per emitting `getppid`).
+underflowed when an invocation spanned a jiffy; a coalescing key deleted in the pass that found it
+expired gave every event before the delete its own full record. Found and documented: the two-sender
+UDP overshoot; element reuse moving a coalesced event to another key; a second full record in one
+window from an event that races the iterator or reads a lagging clock; and that the shutdown wait is
+one poll interval, so a program preempted before `reserve()` for longer than that could still
+commit after the final drain. The busy flag costs nothing measurable (52.10 against 52.29 ns per
+emitting `getppid`).
 
 ## Decision log
 
@@ -572,11 +636,18 @@ costs nothing measurable (52.10 against 52.29 ns per emitting `getppid`).
 | 2026-11-02 | Key watch state by watch descriptor and drop it on `IN_IGNORED` from the BPF hook | Path and growth maps grew with every container start; the inotify queue can overflow during a flood, the BPF hook sees every removal |
 | 2026-11-02 | Emit a container record only when the bundle's `linux.cgroupsPath` names the cgroup | Previous build: a cgroup an unprivileged user created in `user@1000.service` with a k3s container's id was attributed to that pod |
 | 2026-11-02 | UDP sends and DNS query payloads from `fentry/udp_send_skb` and `udp_v6_send_skb`, never from the sender's buffer | Reading the buffer after `udp_sendmsg`: 15,498 `evil.com` records for 1,429 on the wire under a 0–3 µs rewrite race; from the skb: 1,451 and 1,451 |
+| 2026-11-02 | Ship as OTLP/HTTP logs with JSON the agent formats itself | Any OpenTelemetry Collector ingests it (v0.164.0 parsed 717 of 717); 1.69 M records/s per core with no serializer library |
+| 2026-11-02 | Never block ring draining on the sink; drop whole batches past 64 MiB and report them | Collector outage during a connect flood: 0 ring drops, 250,666 records reported lost in one `pano.sink_loss` record |
+| 2026-11-02 | Coalesce in a plain hash; delete a key one pass after its window expires; overflow emits flagged records | Counts exact under 4.85 M opens; 9,000 new keys in 0.11 s lost no count; the LRU dropped pending counts silently on eviction; deleting in the pass that found a key expired let every event before the delete emit a full record (formal model) |
+| 2026-11-02 | Read the flush iterator 16 KiB at a time | Reads that grew past the kernel's 32 KiB iterator buffer re-ran an element after its count was taken: 2 of 3,000 repeat counts lost, 0 of 6,000 at 16 KiB |
+| 2026-11-02 | Startup hash backlog at most 25% of one core | Peak 0.22 → 0.10 cores; the agent runs for the host's lifetime, so a slower first pass costs nothing |
+| 2026-11-02 | Hold `nf_conntrack` loaded while the NAT program is attached | Owner's call: the agent starts with the host and runs the whole time |
 
 ## Open questions
 
-- Output path: batch size, compression, transport to the collector.
-- Conntrack module pinning: whether holding `nf_conntrack` loaded is acceptable on hosts that unload it.
+- Compression: gzip would shrink the ~710 bytes per OTLP record several times over; left out to keep
+  the sender dependency-free.
+- TLS for collectors that are not on the host.
 - Environment variables: whether an idle-priority read of `/proc/<pid>/environ` for long-lived
   processes is worth its blind spot for short-lived ones.
 
@@ -586,8 +657,8 @@ costs nothing measurable (52.10 against 52.29 ns per emitting `getppid`).
 the record stream to a file; `panopticon decode <file>` prints one JSON object per record.
 
 Implemented: every class above, the startup snapshot, container metadata and container file marks,
-executable and changed-file hashes, clock, loss and repeat records, the decoder. Not implemented:
-shipping the stream off the host.
+executable and changed-file hashes, clock, loss and repeat records, the decoder, OTLP shipping. Not
+implemented: TLS and compression for the OTLP sink.
 
 ### Against Falco
 
@@ -623,7 +694,9 @@ tools the build compiles and runs.
 Startup: the agent hashes every running executable once (91 binaries, 4.07 GB here), about 2.2
 core-seconds over the first 25 s at `SCHED_IDLE` and idle I/O priority. Idle priority does not stop it
 from competing through shared caches, memory bandwidth and SMT siblings: a connect+accept loop running
-during that window measured +409 ns instead of +164 ns.
+during that window measured +409 ns instead of +164 ns. With the backlog throttled to a quarter of one
+core (`9b30ff8`), the same loop pinned to one CPU measured +188, +209 and +370 ns in the agent's first
+10 s (median +209 ns; the third run's baseline was also low).
 
 Memory: 31–34 MB RSS, against Falco's 348 MB.
 
@@ -704,10 +777,15 @@ Each was fixed; details are in the sections named.
   device driver's `open` (a device node moved into a container's watched `etc`), and opened an exited
   program's recorded path without `O_NONBLOCK`, so a FIFO there stopped all hashing. The fixed path
   opens with `O_PATH` first; strace shows a device node is never reopened (Credentials).
+- From the code: the flush iterator's reads grew past the kernel's 32 KiB iterator buffer, and an
+  element whose output overflows it runs again after its count was taken: 2 of 3,000 processes
+  opening `/etc/shadow` twice lost their repeat count. Reads are now 16 KiB; 6,000 lost none
+  (Credentials).
 - From the formal model: recursion misses were not reported, the final drain ran before detaching,
-  the UDP destination count wrapped, and the coalescing window test underflowed (Formal model).
+  the UDP destination count wrapped, the coalescing window test underflowed, and a coalescing key
+  deleted in the pass that found it expired gave every event before the delete its own full record
+  (Formal model, Credentials).
 
 ### Next
 
-1. Shipping the stream off the host.
-2. Counting repeat counts lost to coalescing-map evictions, which are now silent.
+1. TLS and compression for the OTLP sink.
