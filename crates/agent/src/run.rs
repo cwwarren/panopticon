@@ -1,5 +1,6 @@
-use std::collections::HashSet;
-use std::ffi::CString;
+use std::cell::RefCell;
+use std::collections::{HashMap, HashSet};
+use std::ffi::{CString, OsStr};
 use std::fs::{self, File};
 use std::io::{self, Read, Write};
 use std::mem::MaybeUninit;
@@ -78,6 +79,13 @@ const HOME_SECRETS: &[&str] = &[
     ".gnupg",
 ];
 const HOME_CHANGE: &[&str] = &["", ".config/autostart", ".config/systemd/user"];
+const GROW_MAX: usize = 4096;
+const CONTAINER_WATCHES: &[(&str, u32)] = &[
+    ("etc/shadow", READ),
+    ("etc/gshadow", READ),
+    ("etc", CHANGE),
+    ("root/.ssh", READ | CHANGE),
+];
 const SOCKETS: &[&str] = &[
     "/run/docker.sock",
     "/run/containerd/containerd.sock",
@@ -100,7 +108,7 @@ struct Ring {
 }
 
 impl Ring {
-    fn drain(&mut self, out: &mut Vec<u8>, hashes: &mut Hasher) {
+    fn drain(&mut self, out: &mut Vec<u8>, hashes: &mut Hasher, watcher: &Watcher) {
         let head =
             unsafe { AtomicU64::from_ptr(&raw mut (*self.ctl).head) }.load(Ordering::Acquire);
         while self.tail < head {
@@ -120,9 +128,20 @@ impl Ring {
                 let r: types::cgroup_rec = wire::read(&out[start..]);
                 let body = &out[start + size_of::<types::cgroup_rec>()..];
                 let path = String::from_utf8_lossy(&body[..usize::from(r.path_len)]).into_owned();
-                container::push(out, r.h.jiffies, r.id, &path);
+                if let Some(rootfs) = container::push(out, r.h.jiffies, r.id, &path) {
+                    watcher.container(out, r.h.jiffies, &rootfs);
+                }
             } else if ty == types::rec_type::REC_EXEC.0 as u8 {
                 request_hash(hashes, &out[start..]);
+            } else if ty == types::rec_type::REC_FILE.0 as u8 {
+                let r: types::file_rec = wire::read(&out[start..]);
+                let mask = r.k.mask;
+                if mask & libc::IN_ISDIR != 0 && mask & (libc::IN_CREATE | libc::IN_MOVED_TO) != 0 {
+                    let name = out[start + size_of::<types::file_rec>()..]
+                        [..usize::from(r.name_len)]
+                        .to_vec();
+                    watcher.created(out, r.h.jiffies, (r.k.dev, r.k.ino), &name);
+                }
             }
             self.tail += len;
             self.records += 1;
@@ -150,9 +169,11 @@ pub fn run(out_path: &str, poll: Duration) {
     let nclasses = types::ring_class::NR_CLASSES.0 as usize;
     let mut storage = MaybeUninit::uninit();
     let mut open = AgentSkelBuilder::default().open(&mut storage).unwrap();
+    let hz = hz();
     let rodata = open.maps.rodata_data.as_deref_mut().unwrap();
     rodata.nr_cpus = u32::try_from(ncpus).unwrap();
     rodata.agent_tgid = process::id();
+    rodata.file_window = hz;
     for map in [
         &mut open.maps.ring_proc,
         &mut open.maps.ring_net,
@@ -167,6 +188,9 @@ pub fn run(out_path: &str, poll: Duration) {
         .set_max_entries(u32::try_from(nclasses * ncpus).unwrap())
         .unwrap();
     open.progs.file_flush.set_autoattach(false);
+    if !Path::new("/sys/kernel/btf/nf_nat").exists() {
+        open.progs.on_nat.set_autoload(false);
+    }
     let mut skel = open.load().unwrap();
     skel.attach().unwrap();
     let flush = skel
@@ -176,17 +200,16 @@ pub fn run(out_path: &str, poll: Duration) {
         .unwrap();
 
     let mut rings = map_rings(&skel, ncpus, nclasses);
-    let hz = measure_hz(&skel);
-    skel.maps.bss_data.as_deref_mut().unwrap().file_window = hz;
     File::create(out_path).unwrap();
     let mut out = fs::OpenOptions::new().append(true).open(out_path).unwrap();
     let mut buf = Vec::with_capacity(4 << 20);
     buf.extend_from_slice(wire::MAGIC);
     let mut jiffies = push_clock(&skel, &mut buf);
     push_meta(&mut buf, jiffies, ncpus, hz);
-    let inotify = watch(&mut buf, jiffies);
+    let watcher = Watcher::new();
+    watcher.host(&mut buf, jiffies);
     watch_sockets(&skel, &mut buf, jiffies);
-    push_cgroups(&mut buf, jiffies, Path::new("/sys/fs/cgroup"), "");
+    push_cgroups(&mut buf, jiffies, Path::new("/sys/fs/cgroup"), "", &watcher);
     let mut hashes = Hasher::new();
     push_snapshot(&skel, &mut buf, &mut hashes);
     out.write_all(&buf).unwrap();
@@ -198,9 +221,9 @@ pub fn run(out_path: &str, poll: Duration) {
     loop {
         let stop = STOP.load(Ordering::Relaxed);
         for ring in &mut rings {
-            ring.drain(&mut buf, &mut hashes);
+            ring.drain(&mut buf, &mut hashes, &watcher);
         }
-        drain_inotify(inotify);
+        watcher.drain();
         hashes.collect(&mut buf);
         if stop || last_clock.elapsed() >= Duration::from_secs(1) {
             jiffies = push_clock(&skel, &mut buf);
@@ -284,15 +307,17 @@ fn read_jiffies(skel: &AgentSkel) -> u64 {
     unsafe { ptr::read_volatile(&bss.clock_jiffies) }
 }
 
-fn measure_hz(skel: &AgentSkel) -> u64 {
-    let start = (read_jiffies(skel), Instant::now());
-    thread::sleep(Duration::from_millis(200));
-    let ticks = read_jiffies(skel) - start.0;
-    let hz = (ticks as f64 / start.1.elapsed().as_secs_f64()).round() as u64;
-    *[100u64, 250, 300, 1000]
-        .iter()
-        .min_by_key(|&&c| c.abs_diff(hz))
-        .unwrap()
+fn hz() -> u64 {
+    let mut res = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    assert_eq!(
+        unsafe { libc::clock_getres(libc::CLOCK_REALTIME_COARSE, &mut res) },
+        0
+    );
+    assert_eq!(res.tv_sec, 0);
+    1_000_000_000 / u64::try_from(res.tv_nsec).unwrap()
 }
 
 fn push_clock(skel: &AgentSkel, buf: &mut Vec<u8>) -> u64 {
@@ -359,27 +384,31 @@ fn subdirs(dir: &str) -> Vec<PathBuf> {
     entries(dir).into_iter().filter(|p| p.is_dir()).collect()
 }
 
-fn watch_list() -> Vec<(PathBuf, u32)> {
-    let mut list: Vec<(PathBuf, u32)> = WATCHES
+fn watch_list() -> Vec<(PathBuf, u32, bool)> {
+    let mut list: Vec<(PathBuf, u32, bool)> = WATCHES
         .iter()
-        .map(|&(p, m)| (PathBuf::from(p), m))
+        .map(|&(p, m)| (PathBuf::from(p), m, m == CHANGE))
         .collect();
     let mut homes = subdirs("/home");
     homes.push(PathBuf::from("/root"));
     for home in homes {
-        list.extend(HOME_SECRETS.iter().map(|d| (home.join(d), READ | CHANGE)));
-        list.extend(HOME_CHANGE.iter().map(|d| (home.join(d), CHANGE)));
+        list.extend(
+            HOME_SECRETS
+                .iter()
+                .map(|d| (home.join(d), READ | CHANGE, false)),
+        );
+        list.extend(HOME_CHANGE.iter().map(|d| (home.join(d), CHANGE, false)));
     }
-    list.push((PathBuf::from("/etc/systemd/system"), CHANGE));
+    list.push((PathBuf::from("/etc/systemd/system"), CHANGE, true));
     list.extend(
         subdirs("/etc/systemd/system")
             .into_iter()
-            .map(|d| (d, CHANGE)),
+            .map(|d| (d, CHANGE, true)),
     );
     for lib in subdirs("/usr/lib") {
         if lib.to_string_lossy().ends_with("-linux-gnu") {
-            list.push((lib.join("security"), CHANGE));
-            list.push((lib, CHANGE));
+            list.push((lib.join("security"), CHANGE, true));
+            list.push((lib, CHANGE, false));
         }
     }
     list.extend(
@@ -389,39 +418,122 @@ fn watch_list() -> Vec<(PathBuf, u32)> {
                 let name = p.file_name().unwrap().to_string_lossy();
                 name.starts_with("ssh_host_") && name.ends_with("_key")
             })
-            .map(|p| (p, READ)),
+            .map(|p| (p, READ, false)),
     );
     list
 }
 
-fn watch(buf: &mut Vec<u8>, jiffies: u64) -> RawFd {
-    let fd = unsafe { libc::inotify_init1(libc::IN_NONBLOCK | libc::IN_CLOEXEC) };
-    assert!(fd >= 0, "inotify_init1: {}", io::Error::last_os_error());
-    for (path, mask) in watch_list() {
-        let cpath = CString::new(path.as_os_str().as_bytes()).unwrap();
-        if unsafe { libc::inotify_add_watch(fd, cpath.as_ptr(), mask | libc::IN_MASK_ADD) } < 0 {
-            let err = io::Error::last_os_error();
-            assert_eq!(
-                err.raw_os_error(),
-                Some(libc::ENOENT),
-                "inotify_add_watch {path:?}: {err}"
-            );
-            continue;
+struct Watcher {
+    fd: RawFd,
+    grow: RefCell<HashMap<(u32, u64), (PathBuf, u32)>>,
+}
+
+impl Watcher {
+    fn new() -> Self {
+        let fd = unsafe { libc::inotify_init1(libc::IN_NONBLOCK | libc::IN_CLOEXEC) };
+        assert!(fd >= 0, "inotify_init1: {}", io::Error::last_os_error());
+        Watcher {
+            fd,
+            grow: RefCell::new(HashMap::new()),
         }
-        let meta = fs::metadata(&path).unwrap();
+    }
+
+    fn add(
+        &self,
+        buf: &mut Vec<u8>,
+        jiffies: u64,
+        path: &Path,
+        mask: u32,
+    ) -> io::Result<(u32, u64)> {
+        let cpath = CString::new(path.as_os_str().as_bytes()).unwrap();
+        if unsafe { libc::inotify_add_watch(self.fd, cpath.as_ptr(), mask | libc::IN_MASK_ADD) } < 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        let meta = if mask & libc::IN_DONT_FOLLOW != 0 {
+            fs::symlink_metadata(path)?
+        } else {
+            fs::metadata(path)?
+        };
+        let dev = wire::kernel_dev(meta.dev());
         wire::push(
             buf,
             wire::REC_WATCH,
             jiffies,
             &[
-                &wire::kernel_dev(meta.dev()).to_ne_bytes(),
+                &dev.to_ne_bytes(),
                 &mask.to_ne_bytes(),
                 &meta.ino().to_ne_bytes(),
                 path.as_os_str().as_bytes(),
             ],
         );
+        Ok((dev, meta.ino()))
     }
-    fd
+
+    fn host(&self, buf: &mut Vec<u8>, jiffies: u64) {
+        for (path, mask, grow) in watch_list() {
+            match self.add(buf, jiffies, &path, mask) {
+                Ok(key) if grow => {
+                    self.grow.borrow_mut().insert(key, (path, mask));
+                }
+                Ok(_) => {}
+                Err(err) => assert_eq!(
+                    err.raw_os_error(),
+                    Some(libc::ENOENT),
+                    "inotify_add_watch {path:?}: {err}"
+                ),
+            }
+        }
+    }
+
+    fn created(&self, buf: &mut Vec<u8>, jiffies: u64, parent: (u32, u64), name: &[u8]) {
+        let mut grow = self.grow.borrow_mut();
+        let Some((dir, mask)) = grow.get(&parent).cloned() else {
+            return;
+        };
+        if grow.len() >= GROW_MAX {
+            eprintln!(
+                "watch limit reached, not marking {dir:?}/{}",
+                String::from_utf8_lossy(name)
+            );
+            return;
+        }
+        let path = dir.join(OsStr::from_bytes(name));
+        match self.add(buf, jiffies, &path, mask | libc::IN_DONT_FOLLOW) {
+            Ok(key) => {
+                grow.insert(key, (path, mask));
+            }
+            Err(err) if err.raw_os_error() == Some(libc::ENOENT) => {}
+            Err(err) => eprintln!("watch {path:?}: {err}"),
+        }
+    }
+
+    fn container(&self, buf: &mut Vec<u8>, jiffies: u64, rootfs: &Path) {
+        for &(rel, mask) in CONTAINER_WATCHES {
+            let path = rootfs.join(rel);
+            if let Err(err) = self.add(buf, jiffies, &path, mask | libc::IN_DONT_FOLLOW)
+                && err.raw_os_error() != Some(libc::ENOENT)
+            {
+                eprintln!("container watch {path:?}: {err}");
+            }
+        }
+    }
+
+    fn drain(&self) {
+        let mut scratch = [0u8; 4096];
+        loop {
+            let n = unsafe { libc::read(self.fd, scratch.as_mut_ptr().cast(), scratch.len()) };
+            if n > 0 {
+                continue;
+            }
+            let err = io::Error::last_os_error();
+            assert!(
+                n < 0 && err.kind() == io::ErrorKind::WouldBlock,
+                "inotify read: {err}"
+            );
+            return;
+        }
+    }
 }
 
 fn watch_sockets(skel: &AgentSkel, buf: &mut Vec<u8>, jiffies: u64) {
@@ -516,23 +628,7 @@ fn push_cwd(buf: &mut Vec<u8>, r: &types::exec_rec) {
     );
 }
 
-fn drain_inotify(fd: RawFd) {
-    let mut scratch = [0u8; 4096];
-    loop {
-        let n = unsafe { libc::read(fd, scratch.as_mut_ptr().cast(), scratch.len()) };
-        if n > 0 {
-            continue;
-        }
-        let err = io::Error::last_os_error();
-        assert!(
-            n < 0 && err.kind() == io::ErrorKind::WouldBlock,
-            "inotify read: {err}"
-        );
-        return;
-    }
-}
-
-fn push_cgroups(buf: &mut Vec<u8>, jiffies: u64, dir: &Path, rel: &str) {
+fn push_cgroups(buf: &mut Vec<u8>, jiffies: u64, dir: &Path, rel: &str, watcher: &Watcher) {
     let meta = match fs::metadata(dir) {
         Ok(meta) => meta,
         Err(err) if err.kind() == io::ErrorKind::NotFound => return,
@@ -551,7 +647,9 @@ fn push_cgroups(buf: &mut Vec<u8>, jiffies: u64, dir: &Path, rel: &str) {
             path.as_bytes(),
         ],
     );
-    container::push(buf, jiffies, meta.ino(), path);
+    if let Some(rootfs) = container::push(buf, jiffies, meta.ino(), path) {
+        watcher.container(buf, jiffies, &rootfs);
+    }
     let entries = match fs::read_dir(dir) {
         Ok(entries) => entries,
         Err(err) if err.kind() == io::ErrorKind::NotFound => return,
@@ -561,7 +659,7 @@ fn push_cgroups(buf: &mut Vec<u8>, jiffies: u64, dir: &Path, rel: &str) {
         let entry = entry.unwrap();
         if entry.file_type().unwrap().is_dir() {
             let child = format!("{rel}/{}", entry.file_name().to_string_lossy());
-            push_cgroups(buf, jiffies, &entry.path(), &child);
+            push_cgroups(buf, jiffies, &entry.path(), &child, watcher);
         }
     }
 }

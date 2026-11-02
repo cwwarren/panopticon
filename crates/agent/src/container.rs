@@ -31,10 +31,8 @@ struct Meta {
     flags: u8,
 }
 
-pub fn push(buf: &mut Vec<u8>, jiffies: u64, cgroup: u64, path: &str) {
-    let Some(meta) = resolve(path) else {
-        return;
-    };
+pub fn push(buf: &mut Vec<u8>, jiffies: u64, cgroup: u64, path: &str) -> Option<PathBuf> {
+    let (meta, rootfs) = resolve(path)?;
     let strings = [
         meta.runtime,
         &meta.id,
@@ -54,9 +52,10 @@ pub fn push(buf: &mut Vec<u8>, jiffies: u64, cgroup: u64, path: &str) {
             strings.as_bytes(),
         ],
     );
+    rootfs
 }
 
-fn resolve(path: &str) -> Option<Meta> {
+fn resolve(path: &str) -> Option<(Meta, Option<PathBuf>)> {
     let last = path.rsplit('/').next()?;
     let (runtime, id) = if let Some(id) = scope(last, "docker-") {
         ("docker", id)
@@ -78,12 +77,18 @@ fn resolve(path: &str) -> Option<Meta> {
         id: id.to_string(),
         ..Meta::default()
     };
+    let config = bundle(&meta.id);
+    let spec = config.as_ref().and_then(|p| json(p));
     if runtime == "docker" {
         docker(&mut meta);
-    } else {
-        oci(&mut meta);
+    } else if let Some(spec) = &spec {
+        oci(&mut meta, spec);
     }
-    Some(meta)
+    let rootfs = config.zip(spec).and_then(|(config, spec)| {
+        let root = spec["root"]["path"].as_str()?.to_string();
+        Some(config.parent()?.join(root))
+    });
+    Some((meta, rootfs))
 }
 
 fn scope<'a>(name: &'a str, prefix: &str) -> Option<&'a str> {
@@ -143,26 +148,18 @@ fn docker(meta: &mut Meta) {
     }
 }
 
-fn bundle(meta: &Meta) -> Option<PathBuf> {
-    let candidates: Vec<PathBuf> = if meta.runtime == "containerd" {
-        CONTAINERD_BUNDLES
-            .iter()
-            .flat_map(|root| fs::read_dir(root).into_iter().flatten())
-            .map(|ns| ns.unwrap().path().join(&meta.id).join("config.json"))
-            .collect()
-    } else {
-        STORAGE
-            .iter()
-            .map(|root| Path::new(root).join(&meta.id).join("userdata/config.json"))
-            .collect()
-    };
-    candidates.into_iter().find(|p| p.exists())
+fn bundle(id: &str) -> Option<PathBuf> {
+    let containerd = CONTAINERD_BUNDLES
+        .iter()
+        .flat_map(|root| fs::read_dir(root).into_iter().flatten())
+        .map(|ns| ns.unwrap().path().join(id).join("config.json"));
+    let storage = STORAGE
+        .iter()
+        .map(|root| Path::new(root).join(id).join("userdata/config.json"));
+    containerd.chain(storage).find(|p| p.exists())
 }
 
-fn oci(meta: &mut Meta) {
-    let Some(spec) = bundle(meta).and_then(|p| json(&p)) else {
-        return;
-    };
+fn oci(meta: &mut Meta, spec: &Value) {
     let ann = &spec["annotations"];
     meta.name = first(
         ann,

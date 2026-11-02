@@ -468,9 +468,9 @@ struct {
 
 const volatile __u32 nr_cpus = 1;
 const volatile __u32 agent_tgid = 0;
+const volatile __u64 file_window = 1;
 __u64 our_group;
 __u64 clock_jiffies;
-__u64 file_window;
 
 extern void bpf_preempt_disable(void) __ksym;
 extern void bpf_preempt_enable(void) __ksym;
