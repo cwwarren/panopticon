@@ -77,18 +77,50 @@ fn resolve(path: &str) -> Option<(Meta, Option<PathBuf>)> {
         id: id.to_string(),
         ..Meta::default()
     };
-    let config = bundle(&meta.id);
-    let spec = config.as_ref().and_then(|p| json(p));
+    let config = bundle(&meta.id)?;
+    let spec = json(&config)?;
+    if !owns(&spec, path) {
+        return None;
+    }
     if runtime == "docker" {
         docker(&mut meta);
-    } else if let Some(spec) = &spec {
-        oci(&mut meta, spec);
+    } else {
+        oci(&mut meta, &spec);
     }
-    let rootfs = config.zip(spec).and_then(|(config, spec)| {
-        let root = spec["root"]["path"].as_str()?.to_string();
-        Some(config.parent()?.join(root))
-    });
+    let rootfs = spec["root"]["path"]
+        .as_str()
+        .and_then(|root| Some(config.parent()?.join(root)));
     Some((meta, rootfs))
+}
+
+fn owns(spec: &Value, path: &str) -> bool {
+    let Some(want) = spec["linux"]["cgroupsPath"].as_str() else {
+        return false;
+    };
+    let [slice, prefix, name] = want.split(':').collect::<Vec<_>>()[..] else {
+        return want == path;
+    };
+    let slice = if slice.is_empty() {
+        "system.slice"
+    } else {
+        slice
+    };
+    let mut expected = String::new();
+    if slice != "-.slice" {
+        let Some(stem) = slice.strip_suffix(".slice") else {
+            return false;
+        };
+        let mut unit = String::new();
+        for part in stem.split('-') {
+            if !unit.is_empty() {
+                unit.push('-');
+            }
+            unit.push_str(part);
+            expected.push_str(&format!("/{unit}.slice"));
+        }
+    }
+    expected.push_str(&format!("/{prefix}-{name}.scope"));
+    expected == path
 }
 
 fn scope<'a>(name: &'a str, prefix: &str) -> Option<&'a str> {

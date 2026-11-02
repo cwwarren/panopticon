@@ -310,6 +310,15 @@ annotations give container name, pod, namespace and image. Flags: privileged (do
 API calls and no per-record work. The decoder attaches the container to every record whose cgroup
 belongs to one.
 
+A cgroup's name proves nothing: a user can create cgroups in the subtree systemd delegates to them
+(`user@UID.service`) and move their processes in, and container ids are readable in any process's
+`/proc/<pid>/cgroup`. The container record is emitted only when the bundle's OCI `linux.cgroupsPath`
+names this exact cgroup (the systemd form `slice:prefix:id` expanded as systemd does, or the cgroupfs
+path). The runtime writes the bundle before it creates the cgroup. The previous build attributed a
+cgroup that an unprivileged user created as `app.slice/cri-containerd-<id>.scope` to the k3s pod with
+that id; this build emits only the cgroup record, whose path shows where it really is. Rootless and
+nested runtimes, whose bundles are outside the paths the agent reads, get no container record.
+
 ### Network attribution
 
 The goal is a join key against network flows: socket cookie, protocol, the socket's own tuple, network
@@ -494,6 +503,7 @@ which the collector sees within a second.
 | 2026-11-02 | Resolve paths under homes and container roots with `openat2(RESOLVE_BENEATH \| RESOLVE_NO_XDEV)`; mark through `/proc/self/fd` | Previous build: a user symlink redirected a mark anywhere on the host, a link loop stopped the agent from starting, a stalled FUSE mount hung it (all reproduced) |
 | 2026-11-02 | Open files to hash with `O_PATH` first and reopen only regular files | `open` on a device node runs its driver (a watchdog arms on open); a container with default `CAP_MKNOD` can place one in its watched `etc` |
 | 2026-11-02 | Key watch state by watch descriptor and drop it on `IN_IGNORED` from the BPF hook | Path and growth maps grew with every container start; the inotify queue can overflow during a flood, the BPF hook sees every removal |
+| 2026-11-02 | Emit a container record only when the bundle's `linux.cgroupsPath` names the cgroup | Previous build: a cgroup an unprivileged user created in `user@1000.service` with a k3s container's id was attributed to that pod |
 
 ## Open questions
 
