@@ -15,15 +15,17 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use libbpf_rs::skel::{OpenSkel, Skel, SkelBuilder};
-use libbpf_rs::{Iter, Link, MapCore, MapFlags, MapHandle, ProgramInput};
+use libbpf_rs::{Iter, Link, MapCore, MapFlags, MapHandle, OpenObject, ProgramInput};
 
 use crate::bpf::{AgentSkel, AgentSkelBuilder, types};
 use crate::container;
 use crate::hash::{self, Hasher};
+use crate::nat_bpf::{NatSkel, NatSkelBuilder};
 use crate::wire;
 
 static STOP: AtomicBool = AtomicBool::new(false);
 
+const NAT_BTF: &str = "/sys/kernel/btf/nf_nat";
 const READ: u32 = libc::IN_OPEN;
 const CHANGE: u32 = libc::IN_CLOSE_WRITE
     | libc::IN_MODIFY
@@ -198,9 +200,6 @@ pub fn run(out_path: &str, poll: Duration) {
         .set_max_entries(u32::try_from(nclasses * ncpus).unwrap())
         .unwrap();
     open.progs.file_flush.set_autoattach(false);
-    if !Path::new("/sys/kernel/btf/nf_nat").exists() {
-        open.progs.on_nat.set_autoload(false);
-    }
     let mut skel = open.load().unwrap();
     skel.attach().unwrap();
     let flush = skel
@@ -219,7 +218,9 @@ pub fn run(out_path: &str, poll: Duration) {
     let watcher = Watcher::new();
     watcher.host(&mut buf, jiffies);
     watch_sockets(&skel, &mut buf, jiffies);
-    register_objects(&skel);
+    let nat_storage = Box::into_raw(Box::new(MaybeUninit::uninit()));
+    let mut nat = attach_nat(&skel, ncpus, nat_storage);
+    register_objects(&skel, nat.as_ref());
     push_cgroups(&mut buf, jiffies, Path::new("/sys/fs/cgroup"), "", &watcher);
     let mut hashes = Hasher::new();
     push_snapshot(&skel, &mut buf, &mut hashes);
@@ -239,6 +240,9 @@ pub fn run(out_path: &str, poll: Duration) {
         hashes.collect(&mut buf);
         if stop || last_clock.elapsed() >= Duration::from_secs(1) {
             jiffies = push_clock(&skel, &mut buf);
+            if nat.is_none() {
+                nat = attach_nat(&skel, ncpus, nat_storage);
+            }
             for ring in &mut rings {
                 push_loss(ring, &mut buf, jiffies);
             }
@@ -605,8 +609,41 @@ impl Watcher {
     }
 }
 
-fn register_objects(skel: &AgentSkel) {
-    let object = skel.object();
+fn attach_nat(
+    skel: &AgentSkel,
+    ncpus: usize,
+    storage: *mut MaybeUninit<OpenObject>,
+) -> Option<NatSkel<'static>> {
+    if !Path::new(NAT_BTF).exists() {
+        return None;
+    }
+    let mut open = NatSkelBuilder::default()
+        .open(unsafe { &mut *storage })
+        .unwrap();
+    open.maps.rodata_data.as_deref_mut().unwrap().nr_cpus = u32::try_from(ncpus).unwrap();
+    open.maps
+        .ring_nat
+        .reuse_fd(skel.maps.ring_nat.as_fd())
+        .unwrap();
+    open.maps.ctl.reuse_fd(skel.maps.ctl.as_fd()).unwrap();
+    let loaded = open.load().and_then(|mut nat| nat.attach().map(|()| nat));
+    loaded.inspect_err(|err| eprintln!("nat: {err}")).ok()
+}
+
+fn register_objects(skel: &AgentSkel, nat: Option<&NatSkel>) {
+    for object in std::iter::once(skel.object()).chain(nat.map(|n| n.object())) {
+        register_object(skel, object);
+    }
+    for map in [
+        &skel.maps.our_maps,
+        &skel.maps.our_progs,
+        &skel.maps.unix_watch,
+    ] {
+        MapHandle::try_from(map).unwrap().freeze().unwrap();
+    }
+}
+
+fn register_object(skel: &AgentSkel, object: &libbpf_rs::Object) {
     for map in object.maps() {
         let id = map.info().unwrap().info.id;
         skel.maps
@@ -629,13 +666,6 @@ fn register_objects(skel: &AgentSkel) {
             .our_progs
             .update(&info.id.to_ne_bytes(), &[1], MapFlags::ANY)
             .unwrap();
-    }
-    for map in [
-        &skel.maps.our_maps,
-        &skel.maps.our_progs,
-        &skel.maps.unix_watch,
-    ] {
-        MapHandle::try_from(map).unwrap().freeze().unwrap();
     }
 }
 

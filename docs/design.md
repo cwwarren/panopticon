@@ -172,7 +172,7 @@ has its own ring on every CPU.
 | net | `fexit/tcp_v4_connect`, `fexit/tcp_v6_connect`, `fexit/inet_csk_accept`, `fexit/inet_listen`, `fexit/inet_bind` and `inet6_bind` (datagram sockets), `fexit/udp_sendmsg`, `fexit/udpv6_sendmsg`, `fentry/skb_consume_udp`, `fexit/packet_create`, `fexit/raw_sk_init`, `fexit/rawv6_init_sk`, `lsm/unix_stream_connect` | process | connect, accept, listen, UDP bind, UDP first send, DNS query, DNS answer, raw socket, unix connect |
 | file | `fentry/inotify_handle_inode_event` (our group only), `iter/bpf_map_elem` on the coalescing map | process | file access or change, repeat count |
 | admin | LSM hooks for module and kexec loads, BPF loads, ptrace access in attach mode, traceme, uid/gid/capability changes, mount/move_mount/umount/pivot_root, settime, user namespaces, signals (`task_kill`), secure anonymous inodes, access to the agent's own BPF objects (`bpf_map`, `bpf_prog`); `fentry/proc_sys_write`; `fexit/create_new_namespaces` and the eight `*ns_install` callbacks | process | admin operation |
-| nat | `fexit/nf_nat_setup_info` (`nf_nat` module) | process or softirq | NAT translation |
+| nat | `fexit/nf_nat_setup_info` (`nf_nat` module), in its own BPF object | process or softirq | NAT translation |
 
 Fork produces no records. Process exit produces one record when the last thread exits.
 
@@ -347,8 +347,14 @@ namespace, process key, image key, cgroup, time.
   destination with the reply source): original and reply tuples, protocol, network namespace. No
   actor: the hook also runs in softirq context, where the current task is unrelated; the original tuple
   joins the record to the container's connect record. Docker egress `172.17.0.2:54560 -> 1.1.1.1:80`
-  is recorded with reply `1.1.1.1:80 -> 192.168.1.18:54560`. The program is not loaded when `nf_nat`
-  has no BTF at start (it then needs an agent restart after the module loads), and while attached it
+  is recorded with reply `1.1.1.1:80 -> 192.168.1.18:54560`. Agents start at boot, often before docker
+  or k3s loads `nf_nat`, and an fexit target is fixed when the program loads. So the program lives in
+  its own BPF object (`nat.bpf.c`) that reuses the main object's nat ring and control maps; the agent
+  loads it at start if `/sys/kernel/btf/nf_nat` exists and otherwise checks once per second.
+  Verified by hiding that file in a private mount namespace and creating it 3 s after start: the
+  program attached on the next check and docker egress was recorded. A failed load (module BTF
+  appears before the module's init finishes) is logged and retried on the next check. A program
+  loaded after start is not in the frozen set of the agent's own program ids. While attached it
   holds a reference that keeps `nf_nat` from being unloaded. Cilium with BPF masquerade keeps NAT state
   in its own map (`cilium_snat_v4_external`) and needs a version-pinned reader; not testable on this
   host.
@@ -598,5 +604,4 @@ floor there is the trampoline plus the record write.
 ### Next
 
 1. Shipping the stream off the host.
-2. Attaching the NAT program when `nf_nat` loads after the agent started.
-3. Counting repeat counts lost to coalescing-map evictions, which are now silent.
+2. Counting repeat counts lost to coalescing-map evictions, which are now silent.

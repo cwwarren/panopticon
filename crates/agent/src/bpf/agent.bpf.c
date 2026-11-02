@@ -1,9 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0
-#include "vmlinux.h"
-#include <bpf/bpf_core_read.h>
-#include <bpf/bpf_endian.h>
-#include <bpf/bpf_helpers.h>
-#include <bpf/bpf_tracing.h>
+#include "ring.h"
 
 char LICENSE[] SEC("license") = "GPL";
 
@@ -16,8 +12,6 @@ char LICENSE[] SEC("license") = "GPL";
 #define IS_ERR_PTR(p) ((unsigned long)(p) >= (unsigned long)-4095)
 #define ADMIN_STR 256
 #define BPF_NAME 16
-#define NF_ACCEPT 1
-#define NF_NAT_MANIP_SRC 0
 #define OVERLAYFS_SUPER_MAGIC 0x794c7630
 #define S_IFMT 00170000
 #define S_IFSOCK 0140000
@@ -29,37 +23,6 @@ char LICENSE[] SEC("license") = "GPL";
 #define SYSCTL_DEPTH 8
 #define SYSCTL_NAME 64
 #define SYSCTL_VALUE 64
-
-enum ring_class {
-	CLASS_PROC,
-	CLASS_NET,
-	CLASS_FILE,
-	CLASS_ADMIN,
-	CLASS_NAT,
-	NR_CLASSES,
-};
-
-enum rec_type {
-	REC_EXEC = 1,
-	REC_CGROUP,
-	REC_CONNECT,
-	REC_ACCEPT,
-	REC_LISTEN,
-	REC_UDP_SEND,
-	REC_DNS_QUERY,
-	REC_DNS_ANSWER,
-	REC_FILE,
-	REC_FILE_REPEAT,
-	REC_EXIT,
-	REC_LOGIN,
-	REC_ADMIN,
-	REC_RAW_SOCKET,
-	REC_UNIX_CONNECT,
-	REC_NAT,
-	REC_PATH,
-	REC_BIND,
-	REC_UNWATCH,
-};
 
 enum rec_flag {
 	FLAG_SNAPSHOT = 1,
@@ -107,28 +70,10 @@ enum rec_flag anchor_rec_flag;
 enum limits anchor_limits;
 enum admin_op anchor_admin_op;
 
-#define PROC_RING (256 << 10)
-#define NET_RING (256 << 10)
-#define FILE_RING (64 << 10)
-#define ADMIN_RING (64 << 10)
-#define NAT_RING (64 << 10)
-#define PROC_SLACK 4096
-#define NET_SLACK 2048
-#define FILE_SLACK 512
-#define ADMIN_SLACK 1024
-#define NAT_SLACK 256
 #define FS_IN_IGNORED 0x00008000
 
 #define UDP_SEEN 4
 #define UDP_CAP 16
-
-struct rec_hdr {
-	__u16 len;
-	__u8 type;
-	__u8 flags;
-	__u32 reserved;
-	__u64 jiffies;
-};
 
 struct actor {
 	__u64 proc;
@@ -276,23 +221,6 @@ struct unix_rec {
 #define CGROUP_MAX (sizeof(struct cgroup_rec) + CGROUP_PATH_MAX)
 #define SOCK_MAX (sizeof(struct sock_rec) + DNS_MAX)
 #define FILE_MAX (sizeof(struct file_rec) + NAME_MAX_REC)
-struct nat_rec {
-	struct rec_hdr h;
-	__u8 orig_src[16];
-	__u8 orig_dst[16];
-	__u8 reply_src[16];
-	__u8 reply_dst[16];
-	__u16 orig_sport;
-	__u16 orig_dport;
-	__u16 reply_sport;
-	__u16 reply_dport;
-	__u32 netns;
-	__u8 family;
-	__u8 proto;
-	__u8 manip;
-	__u8 pad;
-};
-
 #define ADMIN_MAX (sizeof(struct admin_rec) + 2 * ADMIN_STR)
 
 struct exec_rec anchor_exec;
@@ -324,17 +252,6 @@ struct ovl_inode___pano {
 	struct dentry *__upperdentry;
 } __attribute__((preserve_access_index));
 
-struct ctl {
-	__u64 head;
-	__u32 busy;
-	__u32 pad_busy;
-	__u64 pad0[6];
-	__u64 tail;
-	__u64 pad1[7];
-	__u64 drops;
-	__u64 pad2[7];
-};
-
 struct ring_proc_value {
 	__u8 data[PROC_RING + PROC_SLACK];
 };
@@ -349,10 +266,6 @@ struct ring_file_value {
 
 struct ring_admin_value {
 	__u8 data[ADMIN_RING + ADMIN_SLACK];
-};
-
-struct ring_nat_value {
-	__u8 data[NAT_RING + NAT_SLACK];
 };
 
 struct {
@@ -386,22 +299,6 @@ struct {
 	__type(key, __u32);
 	__type(value, struct ring_admin_value);
 } ring_admin SEC(".maps");
-
-struct {
-	__uint(type, BPF_MAP_TYPE_ARRAY);
-	__uint(map_flags, BPF_F_MMAPABLE);
-	__uint(max_entries, 1);
-	__type(key, __u32);
-	__type(value, struct ring_nat_value);
-} ring_nat SEC(".maps");
-
-struct {
-	__uint(type, BPF_MAP_TYPE_ARRAY);
-	__uint(map_flags, BPF_F_MMAPABLE);
-	__uint(max_entries, 1);
-	__type(key, __u32);
-	__type(value, struct ctl);
-} ctl SEC(".maps");
 
 struct task_meta {
 	__u64 spawner;
@@ -494,60 +391,14 @@ struct {
 	__type(value, struct snap_value);
 } snap_scratch SEC(".maps");
 
-const volatile __u32 nr_cpus = 1;
 const volatile __u32 agent_tgid = 0;
 const volatile __u64 file_window = 1;
 __u64 our_group;
 __u64 clock_jiffies;
 
-extern void bpf_preempt_disable(void) __ksym;
-extern void bpf_preempt_enable(void) __ksym;
 extern void bpf_rcu_read_lock(void) __ksym;
 extern void bpf_rcu_read_unlock(void) __ksym;
 extern int bpf_path_d_path(const struct path *path, char *buf, size_t buf__sz) __ksym;
-
-struct ring_slot {
-	struct ctl *c;
-	__u64 head;
-};
-
-static __always_inline void *reserve(void *ring, __u32 class, __u32 size, __u32 max, struct ring_slot *s)
-{
-	__u32 cpu = bpf_get_smp_processor_id();
-	__u32 idx = class * nr_cpus + cpu;
-	struct ctl *c = bpf_map_lookup_elem(&ctl, &idx);
-	__u8 *base = bpf_map_lookup_elem(ring, &cpu);
-	__u64 head, tail;
-
-	if (!c || !base)
-		return NULL;
-	if (__sync_lock_test_and_set(&c->busy, 1)) {
-		__sync_fetch_and_add(&c->drops, 1);
-		return NULL;
-	}
-	head = c->head;
-	tail = __atomic_load_n(&c->tail, __ATOMIC_ACQUIRE);
-	if (head + max - tail > size) {
-		__sync_fetch_and_add(&c->drops, 1);
-		__atomic_store_n(&c->busy, 0, __ATOMIC_RELEASE);
-		return NULL;
-	}
-	s->c = c;
-	s->head = head;
-	return base + (head & (size - 1));
-}
-
-static __always_inline void commit(struct ring_slot *s, struct rec_hdr *h, __u32 len, __u8 type, __u8 flags)
-{
-	len = (len + 7) & ~7;
-	h->len = len;
-	h->type = type;
-	h->flags = flags;
-	h->reserved = 0;
-	h->jiffies = bpf_jiffies64();
-	__atomic_store_n(&s->c->head, s->head + len, __ATOMIC_RELEASE);
-	__atomic_store_n(&s->c->busy, 0, __ATOMIC_RELEASE);
-}
 
 static __always_inline void fill_actor(struct actor *a)
 {
@@ -1727,53 +1578,5 @@ SEC("lsm/userns_create")
 int BPF_PROG(on_userns_create, const struct cred *cred)
 {
 	admin_emit(ADMIN_USERNS, cred->euid.val, 0, 0, 0);
-	return 0;
-}
-
-SEC("fexit/nf_nat_setup_info")
-int BPF_PROG(on_nat, struct nf_conn *ct, void *range, int maniptype, unsigned int ret)
-{
-	struct nf_conntrack_tuple *o = &ct->tuplehash[IP_CT_DIR_ORIGINAL].tuple;
-	struct nf_conntrack_tuple *p = &ct->tuplehash[IP_CT_DIR_REPLY].tuple;
-	union nf_inet_addr *was, *now;
-	__u16 was_port, now_port;
-	struct nat_rec *r;
-	struct ring_slot s;
-
-	if (ret != NF_ACCEPT)
-		return 0;
-	if (maniptype == NF_NAT_MANIP_SRC) {
-		was = &o->src.u3;
-		now = &p->dst.u3;
-		was_port = o->src.u.all;
-		now_port = p->dst.u.all;
-	} else {
-		was = &o->dst.u3;
-		now = &p->src.u3;
-		was_port = o->dst.u.all;
-		now_port = p->src.u.all;
-	}
-	if (was->all[0] == now->all[0] && was->all[1] == now->all[1] && was->all[2] == now->all[2] &&
-	    was->all[3] == now->all[3] && was_port == now_port)
-		return 0;
-	bpf_preempt_disable();
-	r = reserve(&ring_nat, CLASS_NAT, NAT_RING, sizeof(*r), &s);
-	if (r) {
-		__builtin_memcpy(r->orig_src, &o->src.u3, 16);
-		__builtin_memcpy(r->orig_dst, &o->dst.u3, 16);
-		__builtin_memcpy(r->reply_src, &p->src.u3, 16);
-		__builtin_memcpy(r->reply_dst, &p->dst.u3, 16);
-		r->orig_sport = bpf_ntohs(o->src.u.all);
-		r->orig_dport = bpf_ntohs(o->dst.u.all);
-		r->reply_sport = bpf_ntohs(p->src.u.all);
-		r->reply_dport = bpf_ntohs(p->dst.u.all);
-		r->netns = ct->ct_net.net->ns.inum;
-		r->family = o->src.l3num;
-		r->proto = o->dst.protonum;
-		r->manip = maniptype;
-		r->pad = 0;
-		commit(&s, &r->h, sizeof(*r), REC_NAT, 0);
-	}
-	bpf_preempt_enable();
 	return 0;
 }

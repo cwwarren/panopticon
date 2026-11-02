@@ -5,6 +5,9 @@ mod container;
 mod decode;
 mod hash;
 mod run;
+mod nat_bpf {
+    include!(concat!(env!("OUT_DIR"), "/nat.skel.rs"));
+}
 mod wire;
 
 use std::env;
