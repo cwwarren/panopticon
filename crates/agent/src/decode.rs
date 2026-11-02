@@ -156,6 +156,28 @@ fn text(bytes: &[u8]) -> String {
     String::from_utf8_lossy(bytes).into_owned()
 }
 
+fn sysctl_value(raw: &[u8]) -> String {
+    let end = raw.iter().position(|&b| b == 0).unwrap_or(raw.len());
+    if end >= 2
+        && raw[..end]
+            .iter()
+            .all(|b| b.is_ascii_graphic() || *b == b' ')
+    {
+        return text(&raw[..end]);
+    }
+    match raw.len() {
+        1 => raw[0].to_string(),
+        n if n % 4 == 0 => raw
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|c| i32::from_ne_bytes(*c).to_string())
+            .collect::<Vec<_>>()
+            .join(" "),
+        _ => raw.iter().map(|b| format!("{b:02x}")).collect(),
+    }
+}
+
 fn dev(d: u32) -> String {
     format!("{}:{}", d >> 20, d & 0xfffff)
 }
@@ -734,9 +756,16 @@ impl Decoder {
                 let mut parts: Vec<&str> = s0.split('\0').filter(|p| !p.is_empty()).collect();
                 parts.reverse();
                 let name = parts.join("/");
+                let raw = &body[l0..l0 + l1];
                 obj.str("op", "sysctl_write")
                     .str("name", name.strip_prefix("sys/").unwrap_or(&name))
-                    .str("value", s1.trim_end_matches(['\n', '\0']))
+                    .num("ret", a0 as i64)
+                    .num("maxlen", a1 as i64)
+                    .str("value", &sysctl_value(raw))
+                    .str(
+                        "value_hex",
+                        &raw.iter().map(|b| format!("{b:02x}")).collect::<String>(),
+                    )
             }
             op::ADMIN_NS_CREATE => obj
                 .str("op", "ns_create")

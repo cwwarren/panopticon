@@ -22,7 +22,7 @@ char LICENSE[] SEC("license") = "GPL";
 #define STDIN_SOCK 2
 #define SYSCTL_DEPTH 8
 #define SYSCTL_NAME 64
-#define SYSCTL_VALUE 64
+#define SYSCTL_VALUE 256
 
 enum rec_flag {
 	FLAG_SNAPSHOT = 1,
@@ -399,6 +399,45 @@ __u64 clock_jiffies;
 extern void bpf_rcu_read_lock(void) __ksym;
 extern void bpf_rcu_read_unlock(void) __ksym;
 extern int bpf_path_d_path(const struct path *path, char *buf, size_t buf__sz) __ksym;
+extern const void proc_dostring __ksym __weak;
+extern const void proc_dostring_coredump __ksym __weak;
+extern const void proc_dobool __ksym __weak;
+extern const void proc_dointvec __ksym __weak;
+extern const void proc_dointvec_minmax __ksym __weak;
+extern const void proc_dointvec_jiffies __ksym __weak;
+extern const void proc_dointvec_ms_jiffies __ksym __weak;
+extern const void proc_dointvec_userhz_jiffies __ksym __weak;
+extern const void proc_dointvec_minmax_sysadmin __ksym __weak;
+extern const void proc_dointvec_minmax_coredump __ksym __weak;
+extern const void proc_dointvec_minmax_bpf_enable __ksym __weak;
+extern const void proc_dointvec_minmax_bpf_restricted __ksym __weak;
+extern const void proc_douintvec __ksym __weak;
+extern const void proc_douintvec_minmax __ksym __weak;
+extern const void proc_dou8vec_minmax __ksym __weak;
+extern const void proc_doulongvec_minmax __ksym __weak;
+extern const void proc_doulongvec_ms_jiffies_minmax __ksym __weak;
+extern const void yama_dointvec_minmax __ksym __weak;
+extern const void bpf_unpriv_handler __ksym __weak;
+extern const void mmap_min_addr_handler __ksym __weak;
+extern const void devinet_sysctl_forward __ksym __weak;
+extern const void devinet_conf_proc __ksym __weak;
+extern const void ipv4_doint_and_flush __ksym __weak;
+extern const void addrconf_sysctl_forward __ksym __weak;
+extern const void addrconf_sysctl_disable __ksym __weak;
+
+static __always_inline bool value_handler(const void *h)
+{
+	return h && (h == &proc_dostring || h == &proc_dostring_coredump || h == &proc_dobool ||
+		     h == &proc_dointvec || h == &proc_dointvec_minmax || h == &proc_dointvec_jiffies ||
+		     h == &proc_dointvec_ms_jiffies || h == &proc_dointvec_userhz_jiffies ||
+		     h == &proc_dointvec_minmax_sysadmin || h == &proc_dointvec_minmax_coredump ||
+		     h == &proc_dointvec_minmax_bpf_enable || h == &proc_dointvec_minmax_bpf_restricted ||
+		     h == &proc_douintvec || h == &proc_douintvec_minmax || h == &proc_dou8vec_minmax ||
+		     h == &proc_doulongvec_minmax || h == &proc_doulongvec_ms_jiffies_minmax ||
+		     h == &yama_dointvec_minmax || h == &bpf_unpriv_handler || h == &mmap_min_addr_handler ||
+		     h == &devinet_sysctl_forward || h == &devinet_conf_proc || h == &ipv4_doint_and_flush ||
+		     h == &addrconf_sysctl_forward || h == &addrconf_sysctl_disable);
+}
 
 static __always_inline void fill_actor(struct actor *a)
 {
@@ -1427,15 +1466,25 @@ int BPF_PROG(on_settime, const struct timespec64 *ts, const struct timezone *tz)
 	return 0;
 }
 
-SEC("fentry/proc_sys_write")
-int BPF_PROG(on_sysctl_write, struct kiocb *iocb, struct iov_iter *iter)
+SEC("fexit/proc_sys_write")
+int BPF_PROG(on_sysctl_write, struct kiocb *iocb, struct iov_iter *iter, ssize_t ret)
 {
-	struct dentry *d = iocb->ki_filp->f_path.dentry;
+	struct file *f = iocb->ki_filp;
+	struct dentry *d = f->f_path.dentry;
+	const struct ctl_table *table;
+	struct proc_inode *pi;
 	struct admin_rec *r;
 	struct ring_slot s;
 	__u32 pos = 0, vlen = 0;
+	__u64 inode;
 	long n;
+	int maxlen;
 
+	if (bpf_core_read(&inode, sizeof(inode), &f->f_inode))
+		return 0;
+	pi = bpf_core_cast((void *)(inode - bpf_core_field_offset(struct proc_inode, vfs_inode)), struct proc_inode);
+	table = pi->sysctl_entry;
+	maxlen = table->maxlen;
 	bpf_preempt_disable();
 	r = admin_begin(&s, ADMIN_SYSCTL);
 	if (r) {
@@ -1451,14 +1500,15 @@ int BPF_PROG(on_sysctl_write, struct kiocb *iocb, struct iov_iter *iter)
 			d = parent;
 		}
 		pos &= ADMIN_STR - 1;
-		if (iter->iter_type == ITER_UBUF) {
-			vlen = iter->count;
-			if (vlen > SYSCTL_VALUE)
-				vlen = SYSCTL_VALUE;
-			barrier_var(vlen);
-			if (bpf_probe_read_user(r->data + pos, vlen, iter->ubuf))
-				vlen = 0;
-		}
+		r->arg[0] = ret;
+		r->arg[1] = maxlen;
+		if (maxlen > 0 && value_handler(table->proc_handler))
+			vlen = maxlen;
+		if (vlen > SYSCTL_VALUE)
+			vlen = SYSCTL_VALUE;
+		barrier_var(vlen);
+		if (vlen && bpf_probe_read_kernel(r->data + pos, vlen, table->data))
+			vlen = 0;
 		admin_commit(&s, r, pos, vlen);
 	}
 	bpf_preempt_enable();

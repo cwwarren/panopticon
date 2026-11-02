@@ -481,7 +481,7 @@ Hooks that fire only on the operation itself:
 | mount, move_mount, pivot_root | `lsm.s/sb_mount` (`bpf_d_path`); `lsm/move_mount` and `lsm/sb_pivotroot` (`bpf_path_d_path` kfunc: these hooks are not sleepable) | target, source, filesystem type, flags |
 | umount | `lsm/sb_umount` | filesystem type, dev, flags |
 | Clock set | `lsm/settime` | new time |
-| sysctl write | `fentry/proc_sys_write`, writes only | name (bounded dentry walk), value |
+| sysctl write | `fexit/proc_sys_write` | name (bounded dentry walk), return value, `maxlen`, and the value the kernel holds afterwards (up to 256 bytes of the table's data) when the table's handler is one whose data is the value: the generic int, uint, u8, ulong, bool and string handlers and the security and forwarding handlers of `core_pattern`, `kptr_restrict`/`dmesg_restrict`, Yama, BPF, `mmap_min_addr`, `ip_forward`, `conf/*` and IPv6 `forwarding`/`disable_ipv6`. Other handlers' data can be a kernel pointer (`tcp_congestion_control`), so they get the name only. The first version read the value from the writer's buffer before the kernel copied it: under a flip race (`bench/results/experiments/sysctl_race.sh`) 129 of 315 writes that set 99 were recorded as 64; the kernel's value matches exactly |
 | Namespace creation | `fexit/create_new_namespaces` | types, unshare or clone, new net and mount namespace inodes |
 | setns | `fexit` on the eight `*ns_install` callbacks, which serve both the fd and the pidfd path | type, target namespace inode |
 | User namespace creation | `lsm/userns_create` | euid |
