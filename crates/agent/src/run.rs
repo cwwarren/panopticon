@@ -1,12 +1,12 @@
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::ffi::{CString, OsStr};
-use std::fs::{self, File};
+use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::mem::MaybeUninit;
-use std::os::fd::{AsFd, AsRawFd, RawFd};
+use std::os::fd::{AsFd, AsRawFd, FromRawFd, RawFd};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
-use std::os::unix::fs::MetadataExt;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::process;
 use std::ptr;
@@ -78,7 +78,7 @@ const HOME_SECRETS: &[&str] = &[
     ".config/gcloud",
     ".gnupg",
 ];
-const HOME_CHANGE: &[&str] = &["", ".config/autostart", ".config/systemd/user"];
+const HOME_CHANGE: &[&str] = &[".config/autostart", ".config/systemd/user"];
 const GROW_MAX: usize = 4096;
 const CONTAINER_WATCHES: &[(&str, u32)] = &[
     ("etc/shadow", READ),
@@ -139,15 +139,19 @@ impl Ring {
                 let name =
                     out[start + size_of::<types::file_rec>()..][..usize::from(r.name_len)].to_vec();
                 if mask & libc::IN_ISDIR != 0 && mask & (libc::IN_CREATE | libc::IN_MOVED_TO) != 0 {
-                    watcher.created(out, r.h.jiffies, (r.k.dev, r.k.ino), &name);
+                    watcher.created(out, r.h.jiffies, r.wd, &name);
                 } else if mask & libc::IN_ISDIR == 0
                     && mask & (libc::IN_CLOSE_WRITE | libc::IN_MOVED_TO) != 0
                     && !name.is_empty()
-                    && let Some(dir) = watcher.path((r.k.dev, r.k.ino))
+                    && let Some(dir) = watcher.path(r.wd)
                 {
                     let path = dir.join(OsStr::from_bytes(&name));
                     hashes.request_file(r.k.dev, r.k.child_ino, &path, r.h.jiffies);
                 }
+            } else if ty == types::rec_type::REC_UNWATCH.0 as u8 {
+                let r: types::unwatch_rec = wire::read(&out[start..]);
+                watcher.forget(r.wd);
+                out.truncate(start);
             }
             self.tail += len;
             self.records += 1;
@@ -219,6 +223,7 @@ pub fn run(out_path: &str, poll: Duration) {
     push_cgroups(&mut buf, jiffies, Path::new("/sys/fs/cgroup"), "", &watcher);
     let mut hashes = Hasher::new();
     push_snapshot(&skel, &mut buf, &mut hashes);
+    hashes.release_backlog();
     out.write_all(&buf).unwrap();
     buf.clear();
     eprintln!("ready");
@@ -252,6 +257,11 @@ pub fn run(out_path: &str, poll: Duration) {
     }
     report(&rings, nclasses, coalesced);
     eprintln!("hash: dropped={}", hashes.dropped);
+    eprintln!(
+        "watch: marks={} grown={}",
+        watcher.paths.borrow().len(),
+        watcher.grow.borrow().len()
+    );
 }
 
 fn map_rings(skel: &AgentSkel, ncpus: usize, nclasses: usize) -> Vec<Ring> {
@@ -396,16 +406,6 @@ fn watch_list() -> Vec<(PathBuf, u32, bool)> {
         .iter()
         .map(|&(p, m)| (PathBuf::from(p), m, m == CHANGE))
         .collect();
-    let mut homes = subdirs("/home");
-    homes.push(PathBuf::from("/root"));
-    for home in homes {
-        list.extend(
-            HOME_SECRETS
-                .iter()
-                .map(|d| (home.join(d), READ | CHANGE, false)),
-        );
-        list.extend(HOME_CHANGE.iter().map(|d| (home.join(d), CHANGE, false)));
-    }
     list.push((PathBuf::from("/etc/systemd/system"), CHANGE, true));
     list.extend(
         subdirs("/etc/systemd/system")
@@ -432,8 +432,8 @@ fn watch_list() -> Vec<(PathBuf, u32, bool)> {
 
 struct Watcher {
     fd: RawFd,
-    paths: RefCell<HashMap<(u32, u64), PathBuf>>,
-    grow: RefCell<HashMap<(u32, u64), (PathBuf, u32)>>,
+    paths: RefCell<HashMap<i32, PathBuf>>,
+    grow: RefCell<HashMap<i32, (PathBuf, u32)>>,
 }
 
 impl Watcher {
@@ -447,27 +447,70 @@ impl Watcher {
         }
     }
 
-    fn path(&self, key: (u32, u64)) -> Option<PathBuf> {
-        self.paths.borrow().get(&key).cloned()
+    fn path(&self, wd: i32) -> Option<PathBuf> {
+        self.paths.borrow().get(&wd).cloned()
     }
 
-    fn add(
+    fn forget(&self, wd: i32) {
+        self.paths.borrow_mut().remove(&wd);
+        self.grow.borrow_mut().remove(&wd);
+    }
+
+    fn add(&self, buf: &mut Vec<u8>, jiffies: u64, path: &Path, mask: u32) -> io::Result<i32> {
+        let file = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_PATH)
+            .open(path)?;
+        self.mark(buf, jiffies, &file, path, mask)
+    }
+
+    fn add_beneath(
         &self,
         buf: &mut Vec<u8>,
         jiffies: u64,
-        path: &Path,
+        root: &Path,
+        rel: &Path,
         mask: u32,
-    ) -> io::Result<(u32, u64)> {
-        let cpath = CString::new(path.as_os_str().as_bytes()).unwrap();
-        if unsafe { libc::inotify_add_watch(self.fd, cpath.as_ptr(), mask | libc::IN_MASK_ADD) } < 0
-        {
+    ) -> io::Result<i32> {
+        let dir = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_PATH | libc::O_DIRECTORY)
+            .open(root)?;
+        let crel = CString::new(rel.as_os_str().as_bytes()).unwrap();
+        let mut how: libc::open_how = unsafe { std::mem::zeroed() };
+        how.flags = (libc::O_PATH | libc::O_CLOEXEC) as u64;
+        how.resolve = libc::RESOLVE_BENEATH | libc::RESOLVE_NO_XDEV | libc::RESOLVE_NO_MAGICLINKS;
+        let fd = unsafe {
+            libc::syscall(
+                libc::SYS_openat2,
+                dir.as_raw_fd(),
+                crel.as_ptr(),
+                &raw const how,
+                size_of::<libc::open_how>(),
+            )
+        };
+        if fd < 0 {
             return Err(io::Error::last_os_error());
         }
-        let meta = if mask & libc::IN_DONT_FOLLOW != 0 {
-            fs::symlink_metadata(path)?
-        } else {
-            fs::metadata(path)?
-        };
+        let file = unsafe { File::from_raw_fd(RawFd::try_from(fd).unwrap()) };
+        self.mark(buf, jiffies, &file, &root.join(rel), mask)
+    }
+
+    fn mark(
+        &self,
+        buf: &mut Vec<u8>,
+        jiffies: u64,
+        file: &File,
+        path: &Path,
+        mask: u32,
+    ) -> io::Result<i32> {
+        let meta = file.metadata()?;
+        let target = CString::new(format!("/proc/self/fd/{}", file.as_raw_fd())).unwrap();
+        let wd =
+            unsafe { libc::inotify_add_watch(self.fd, target.as_ptr(), mask | libc::IN_MASK_ADD) };
+        if wd < 0 {
+            return Err(io::Error::last_os_error());
+        }
         let dev = wire::kernel_dev(meta.dev());
         wire::push(
             buf,
@@ -480,57 +523,67 @@ impl Watcher {
                 path.as_os_str().as_bytes(),
             ],
         );
-        self.paths
-            .borrow_mut()
-            .insert((dev, meta.ino()), path.to_path_buf());
-        Ok((dev, meta.ino()))
+        self.paths.borrow_mut().insert(wd, path.to_path_buf());
+        Ok(wd)
     }
 
     fn host(&self, buf: &mut Vec<u8>, jiffies: u64) {
         for (path, mask, grow) in watch_list() {
             match self.add(buf, jiffies, &path, mask) {
-                Ok(key) if grow => {
-                    self.grow.borrow_mut().insert(key, (path, mask));
+                Ok(wd) if grow => {
+                    self.grow.borrow_mut().insert(wd, (path, mask));
                 }
                 Ok(_) => {}
                 Err(err) => assert_eq!(
                     err.raw_os_error(),
                     Some(libc::ENOENT),
-                    "inotify_add_watch {path:?}: {err}"
+                    "watch {path:?}: {err}"
                 ),
+            }
+        }
+        let mut homes = subdirs("/home");
+        homes.push(PathBuf::from("/root"));
+        for home in homes {
+            if let Err(err) = self.add(buf, jiffies, &home, CHANGE) {
+                eprintln!("home watch {home:?}: {err}");
+                continue;
+            }
+            let secrets = HOME_SECRETS.iter().map(|&d| (d, READ | CHANGE));
+            let change = HOME_CHANGE.iter().map(|&d| (d, CHANGE));
+            for (rel, mask) in secrets.chain(change) {
+                if let Err(err) = self.add_beneath(buf, jiffies, &home, Path::new(rel), mask)
+                    && err.raw_os_error() != Some(libc::ENOENT)
+                {
+                    eprintln!("home watch {home:?} {rel}: {err}");
+                }
             }
         }
     }
 
-    fn created(&self, buf: &mut Vec<u8>, jiffies: u64, parent: (u32, u64), name: &[u8]) {
-        let mut grow = self.grow.borrow_mut();
-        let Some((dir, mask)) = grow.get(&parent).cloned() else {
+    fn created(&self, buf: &mut Vec<u8>, jiffies: u64, parent: i32, name: &[u8]) {
+        let Some((dir, mask)) = self.grow.borrow().get(&parent).cloned() else {
             return;
         };
-        if grow.len() >= GROW_MAX {
-            eprintln!(
-                "watch limit reached, not marking {dir:?}/{}",
-                String::from_utf8_lossy(name)
-            );
+        let name = Path::new(OsStr::from_bytes(name));
+        if self.grow.borrow().len() >= GROW_MAX {
+            eprintln!("watch limit reached, not marking {:?}", dir.join(name));
             return;
         }
-        let path = dir.join(OsStr::from_bytes(name));
-        match self.add(buf, jiffies, &path, mask | libc::IN_DONT_FOLLOW) {
-            Ok(key) => {
-                grow.insert(key, (path, mask));
+        match self.add_beneath(buf, jiffies, &dir, name, mask) {
+            Ok(wd) => {
+                self.grow.borrow_mut().insert(wd, (dir.join(name), mask));
             }
             Err(err) if err.raw_os_error() == Some(libc::ENOENT) => {}
-            Err(err) => eprintln!("watch {path:?}: {err}"),
+            Err(err) => eprintln!("watch {:?}: {err}", dir.join(name)),
         }
     }
 
     fn container(&self, buf: &mut Vec<u8>, jiffies: u64, rootfs: &Path) {
         for &(rel, mask) in CONTAINER_WATCHES {
-            let path = rootfs.join(rel);
-            if let Err(err) = self.add(buf, jiffies, &path, mask | libc::IN_DONT_FOLLOW)
+            if let Err(err) = self.add_beneath(buf, jiffies, rootfs, Path::new(rel), mask)
                 && err.raw_os_error() != Some(libc::ENOENT)
             {
-                eprintln!("container watch {path:?}: {err}");
+                eprintln!("container watch {rootfs:?} {rel}: {err}");
             }
         }
     }

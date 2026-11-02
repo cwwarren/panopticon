@@ -4,7 +4,7 @@ use std::io;
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::Path;
-use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
+use std::sync::mpsc::{self, Receiver, Sender, SyncSender, TrySendError};
 use std::thread;
 
 use sha2::{Digest, Sha256};
@@ -12,6 +12,8 @@ use sha2::{Digest, Sha256};
 use crate::wire;
 
 const QUEUE: usize = 1024;
+// Distinct executables remembered before the set is cleared; a cleared key costs one idle re-hash.
+const SEEN_MAX: usize = 1 << 16;
 const IOPRIO_CLASS_IDLE: libc::c_int = 3;
 const IOPRIO_CLASS_SHIFT: libc::c_int = 13;
 const IOPRIO_WHO_PROCESS: libc::c_int = 1;
@@ -32,7 +34,9 @@ struct Job {
 
 pub struct Hasher {
     seen: HashSet<Key>,
+    backlog: Option<Vec<Job>>,
     jobs: SyncSender<Job>,
+    results: Sender<Vec<u8>>,
     done: Receiver<Vec<u8>>,
     pub dropped: u64,
 }
@@ -41,37 +45,46 @@ impl Hasher {
     pub fn new() -> Self {
         let (jobs, queue) = mpsc::sync_channel::<Job>(QUEUE);
         let (results, done) = mpsc::channel();
-        thread::spawn(move || {
-            idle();
-            for job in queue {
-                if let Some(rec) = hash(&job)
-                    && results.send(rec).is_err()
-                {
-                    return;
-                }
-            }
-        });
+        let sender = results.clone();
+        thread::spawn(move || work(queue, &sender));
         Hasher {
             seen: HashSet::new(),
+            backlog: Some(Vec::new()),
             jobs,
+            results,
             done,
             dropped: 0,
         }
     }
 
     pub fn request(&mut self, key: Key, pid: u32, path: &[u8], jiffies: u64) {
-        if key.ino == 0 || !self.seen.insert(key) {
+        if key.ino == 0 || self.seen.contains(&key) {
             return;
         }
+        if self.seen.len() >= SEEN_MAX {
+            self.seen.clear();
+        }
+        self.seen.insert(key);
         let job = Job {
             key,
             pid: Some(pid),
             path: String::from_utf8_lossy(path).into_owned(),
             jiffies,
         };
-        if !self.send(job) {
-            self.seen.remove(&key);
+        match &mut self.backlog {
+            Some(backlog) => backlog.push(job),
+            None => {
+                if !self.send(job) {
+                    self.seen.remove(&key);
+                }
+            }
         }
+    }
+
+    pub fn release_backlog(&mut self) {
+        let jobs = self.backlog.take().unwrap();
+        let results = self.results.clone();
+        thread::spawn(move || work(jobs, &results));
     }
 
     pub fn request_file(&mut self, dev: u32, ino: u64, path: &Path, jiffies: u64) {
@@ -102,6 +115,17 @@ impl Hasher {
     }
 }
 
+fn work(jobs: impl IntoIterator<Item = Job>, results: &Sender<Vec<u8>>) {
+    idle();
+    for job in jobs {
+        if let Some(rec) = hash(&job)
+            && results.send(rec).is_err()
+        {
+            return;
+        }
+    }
+}
+
 fn idle() {
     let param = libc::sched_param { sched_priority: 0 };
     assert_eq!(
@@ -121,31 +145,39 @@ fn idle() {
 
 fn open(job: &Job) -> Option<(File, Key, u64)> {
     let candidates = match job.pid {
-        Some(pid) => vec![format!("/proc/{pid}/exe"), job.path.clone()],
-        None => vec![job.path.clone()],
+        Some(pid) => vec![
+            (format!("/proc/{pid}/exe"), 0),
+            (job.path.clone(), libc::O_NOFOLLOW),
+        ],
+        None => vec![(job.path.clone(), libc::O_NOFOLLOW)],
     };
-    for path in candidates {
-        let mut options = OpenOptions::new();
-        options.read(true);
-        if job.pid.is_none() {
-            options.custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW);
-        }
-        let Ok(file) = options.open(&path) else {
+    for (path, nofollow) in candidates {
+        let Ok(handle) = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_PATH | nofollow)
+            .open(&path)
+        else {
             continue;
         };
-        let meta = file.metadata().unwrap();
+        let meta = handle.metadata().unwrap();
         let key = Key {
             dev: wire::kernel_dev(meta.dev()),
             ino: meta.ino(),
             ctime: meta.ctime(),
         };
-        if meta.is_file()
-            && key.dev == job.key.dev
-            && key.ino == job.key.ino
-            && (job.pid.is_none() || key.ctime == job.key.ctime)
+        if !meta.is_file()
+            || key.dev != job.key.dev
+            || key.ino != job.key.ino
+            || (job.pid.is_some() && key.ctime != job.key.ctime)
         {
-            return Some((file, key, meta.size()));
+            continue;
         }
+        let file = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NONBLOCK)
+            .open(format!("/proc/self/fd/{}", handle.as_raw_fd()))
+            .ok()?;
+        return Some((file, key, meta.size()));
     }
     None
 }

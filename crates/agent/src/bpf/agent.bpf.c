@@ -58,6 +58,7 @@ enum rec_type {
 	REC_NAT,
 	REC_PATH,
 	REC_BIND,
+	REC_UNWATCH,
 };
 
 enum rec_flag {
@@ -97,7 +98,7 @@ enum limits {
 	ARGV_MAX_ARGS = 32,
 	CGROUP_PATH_MAX = 256,
 	DNS_MAX = 512,
-	NAME_MAX_REC = 64,
+	NAME_MAX_REC = 255,
 };
 
 enum ring_class anchor_ring_class;
@@ -116,6 +117,7 @@ enum admin_op anchor_admin_op;
 #define FILE_SLACK 512
 #define ADMIN_SLACK 1024
 #define NAT_SLACK 256
+#define FS_IN_IGNORED 0x00008000
 
 #define UDP_SEEN 4
 #define UDP_CAP 16
@@ -209,7 +211,8 @@ struct file_rec {
 	struct actor a;
 	struct file_key k;
 	__u16 name_len;
-	__u8 pad[6];
+	__u16 pad;
+	__s32 wd;
 	__u8 name[];
 };
 
@@ -217,6 +220,12 @@ struct file_repeat_rec {
 	struct rec_hdr h;
 	struct file_key k;
 	__u64 count;
+};
+
+struct unwatch_rec {
+	struct rec_hdr h;
+	__s32 wd;
+	__u32 pad;
 };
 
 struct exit_rec {
@@ -291,6 +300,7 @@ struct cgroup_rec anchor_cgroup;
 struct sock_rec anchor_sock;
 struct file_rec anchor_file;
 struct file_repeat_rec anchor_file_repeat;
+struct unwatch_rec anchor_unwatch;
 struct exit_rec anchor_exit;
 struct login_rec anchor_login;
 struct admin_rec anchor_admin;
@@ -1190,12 +1200,28 @@ int BPF_PROG(on_inotify_event, struct fsnotify_mark *mark, __u32 mask, struct in
 	struct task_struct *leader;
 	struct file_seen *seen, fresh = {};
 	struct file_key k = {};
+	struct unwatch_rec *u;
 	struct file_rec *r;
 	struct ring_slot s;
 	__u64 now;
 	__u32 len = 0;
+	__s32 wd;
 
 	if (!our_group || (__u64)mark->group != our_group)
+		return 0;
+	wd = bpf_core_cast(mark, struct inotify_inode_mark)->wd;
+	if (mask & FS_IN_IGNORED) {
+		bpf_preempt_disable();
+		u = reserve(&ring_file, CLASS_FILE, FILE_RING, sizeof(*u), &s);
+		if (u) {
+			u->wd = wd;
+			u->pad = 0;
+			commit(&s, &u->h, sizeof(*u), REC_UNWATCH, 0);
+		}
+		bpf_preempt_enable();
+		return 0;
+	}
+	if ((bpf_get_current_pid_tgid() >> 32) == agent_tgid)
 		return 0;
 	leader = bpf_get_current_task_btf()->group_leader;
 	now = bpf_jiffies64();
@@ -1222,7 +1248,8 @@ int BPF_PROG(on_inotify_event, struct fsnotify_mark *mark, __u32 mask, struct in
 	if (r) {
 		fill_actor(&r->a);
 		r->k = k;
-		__builtin_memset(r->pad, 0, sizeof(r->pad));
+		r->pad = 0;
+		r->wd = wd;
 		if (name) {
 			len = name->len;
 			if (len > NAME_MAX_REC)

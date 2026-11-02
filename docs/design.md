@@ -169,9 +169,9 @@ has its own ring on every CPU.
 | Class | Hooks | Context | Records |
 |---|---|---|---|
 | proc | `tp_btf/sched_process_fork` (state only), `lsm.s/bprm_committed_creds`, `tp_btf/sched_process_exit`, `fexit/audit_set_loginuid`, `tp_btf/cgroup_mkdir` | process | exec, exit, login, cgroup |
-| net | `fexit/tcp_v4_connect`, `fexit/tcp_v6_connect`, `fexit/inet_csk_accept`, `fexit/inet_listen`, `fexit/udp_sendmsg`, `fexit/udpv6_sendmsg`, `fentry/skb_consume_udp`, `fexit/packet_create`, `fexit/raw_sk_init`, `fexit/rawv6_init_sk`, `lsm/unix_stream_connect` | process | connect, accept, listen, UDP first send, DNS query, DNS answer, raw socket, unix connect |
+| net | `fexit/tcp_v4_connect`, `fexit/tcp_v6_connect`, `fexit/inet_csk_accept`, `fexit/inet_listen`, `fexit/inet_bind` and `inet6_bind` (datagram sockets), `fexit/udp_sendmsg`, `fexit/udpv6_sendmsg`, `fentry/skb_consume_udp`, `fexit/packet_create`, `fexit/raw_sk_init`, `fexit/rawv6_init_sk`, `lsm/unix_stream_connect` | process | connect, accept, listen, UDP bind, UDP first send, DNS query, DNS answer, raw socket, unix connect |
 | file | `fentry/inotify_handle_inode_event` (our group only), `iter/bpf_map_elem` on the coalescing map | process | file access or change, repeat count |
-| admin | LSM hooks for module and kexec loads, BPF loads, ptrace access in attach mode, traceme, uid/gid/capability changes, mount/move_mount/umount/pivot_root, settime, user namespaces; `fentry/proc_sys_write`; `fexit/create_new_namespaces` and the eight `*ns_install` callbacks | process | admin operation |
+| admin | LSM hooks for module and kexec loads, BPF loads, ptrace access in attach mode, traceme, uid/gid/capability changes, mount/move_mount/umount/pivot_root, settime, user namespaces, signals (`task_kill`), secure anonymous inodes, access to the agent's own BPF objects (`bpf_map`, `bpf_prog`); `fentry/proc_sys_write`; `fexit/create_new_namespaces` and the eight `*ns_install` callbacks | process | admin operation |
 | nat | `fexit/nf_nat_setup_info` (`nf_nat` module) | process or softirq | NAT translation |
 
 Fork produces no records. Process exit produces one record when the last thread exits.
@@ -189,12 +189,20 @@ Fork produces no records. Process exit produces one record when the last thread 
   the image key, so a child that forks without exec'ing joins back to the program it is running.
 - One exec record per successful exec, emitted after the point of no return: process key, exec
   sequence, spawner, current parent, previous image key (the program that called exec), cgroup id,
-  uid/euid/gid/egid, loginuid, sessionid, effective capabilities, controlling terminal, executable
-  dev/inode/ctime, mode, link count and filesystem magic, executable path, argv (bounded, never the
-  environment). The previous image key attributes an exec by a fork-only child (a subshell, a
-  double-forked daemon) to the program it was running, without fork records. Mode, link count and
-  filesystem make setuid binaries, deleted executables and memfd execution (`nlink` 0 on tmpfs)
-  visible without extra hooks.
+  uid/euid/gid/egid, loginuid, sessionid, effective capabilities, controlling terminal, working
+  directory (dev, inode), executable dev/inode/ctime, mode, link count and filesystem magic, whether
+  the executable sits on an overlayfs upper layer, whether stdin, stdout and stderr are sockets,
+  executable path, argv (bounded, never the environment). The previous image key attributes an exec
+  by a fork-only child (a subshell, a double-forked daemon) to the program it was running, without
+  fork records. Mode, link count and filesystem make setuid binaries, deleted executables and memfd
+  execution (`nlink` 0 on tmpfs) visible without extra hooks; the upper-layer flag marks a container
+  running a binary it wrote or modified (drift, read through CO-RE on `ovl_inode` and skipped when
+  the overlay module's BTF is absent); socket stdio marks reverse shells.
+- Working directory: the exec record carries the directory's (dev, inode). The first exec in a
+  directory not seen recently (LRU set of 4096) also emits a path record from a bounded dentry walk
+  that crosses mounts up to the namespace root, so the path is container-relative inside containers.
+  `bpf_d_path` cannot be used on `current->fs->pwd` (a walked pointer). Snapshot processes get their
+  directory from `/proc/<pid>/cwd`.
 - One exit record when a process's last thread exits (`sched_process_exit` with `group_dead`): wait
   status, total CPU time, start time (`start_boottime`, converted with the boottime reference in the
   clock record). 70 ns per process exit.
@@ -206,8 +214,11 @@ Fork produces no records. Process exit produces one record when the last thread 
 - Executable hashes: userspace queues each distinct (dev, inode, ctime) once to a worker thread
   running `SCHED_IDLE` with idle I/O priority. It hashes `/proc/<pid>/exe` (the exact inode even if the
   path was replaced or deleted), falling back to the recorded path with the key verified, and drops the
-  pages it read (`POSIX_FADV_DONTNEED`: a 200 MB binary left 0 bytes resident, 190.8 MB without). This
-  host's 91 running binaries (4.07 GB) hash in about 25 s of idle time.
+  pages it read (`POSIX_FADV_DONTNEED`: a 200 MB binary left 0 bytes resident, 190.8 MB without). The
+  startup snapshot's executables go to a second idle thread that exits when done, so live execs and
+  file changes never wait behind it: this host's 91 running binaries (4.07 GB) take about 25 s, and a
+  file changed 3 s after start was hashed in the same run. The set of keys already queued holds at most
+  65,536 entries and is cleared when full, which costs a repeated hash, not memory growth.
 
 Volume is one record per exec and per process exit, plus the one-time snapshot.
 
@@ -327,9 +338,13 @@ namespace, process key, image key, cgroup, time.
   destination with the reply source): original and reply tuples, protocol, network namespace. No
   actor: the hook also runs in softirq context, where the current task is unrelated; the original tuple
   joins the record to the container's connect record. Docker egress `172.17.0.2:54560 -> 1.1.1.1:80`
-  is recorded with reply `1.1.1.1:80 -> 192.168.1.18:54560`. Cilium with BPF masquerade keeps NAT state
+  is recorded with reply `1.1.1.1:80 -> 192.168.1.18:54560`. The program is not loaded when `nf_nat`
+  has no BTF at start (it then needs an agent restart after the module loads), and while attached it
+  holds a reference that keeps `nf_nat` from being unloaded. Cilium with BPF masquerade keeps NAT state
   in its own map (`cilium_snat_v4_external`) and needs a version-pinned reader; not testable on this
   host.
+- UDP binds: `fexit/inet_bind` and `inet6_bind` for datagram sockets, on success. TCP servers are
+  covered by listen.
 
 ### Credentials, persistence and integrity
 
@@ -352,14 +367,45 @@ Two kinds of inotify marks:
   that group from `fentry/inotify_update_watch`.
 - `fentry/inotify_handle_inode_event` compares the mark's group with ours. The marked object is `dir`
   when the kernel passes one (an event on a child or on a directory entry), otherwise `inode`. The
-  record carries the marked inode, the child inode and the entry name.
+  record carries the marked inode, the child inode, the entry name (up to 255 bytes, the kernel's
+  `NAME_MAX`, so long names are never cut) and the watch descriptor read from the mark. Events caused
+  by the agent itself (the hash worker opening a changed credential file) are skipped.
+- When the kernel destroys a mark (the directory was deleted, a container's filesystem unmounted), it
+  calls the same function with `IN_IGNORED`. The program then emits an internal record with the watch
+  descriptor, and userspace drops that descriptor's path and growth entry. These maps are keyed by
+  watch descriptor, which the kernel allocates cyclically, so a reused inode number cannot remove a
+  newer entry. A container start and exit leaves both maps at their previous size.
 - Coalescing: the first event per (process key, `self_exec_id`, marked inode, child inode, mask) in a
   one-second window emits a record; later ones increment a counter in an LRU hash of 4096 keys. A
   `bpf_map_elem` iterator, read once per second and at shutdown, swaps each counter with zero and
   emits a repeat record. With `self_exec_id` in the key, a program exec'd by the process gets its own
   record instead of disappearing into the previous program's count.
-- Not marked: subdirectories created after startup, and the copies inside containers (marking them
-  through `/proc/<pid>/root/<path>` at container start is planned).
+- Containers: when a container's cgroup appears, the agent locates its OCI bundle (containerd,
+  docker through containerd's `moby` namespace, CRI-O, podman) and marks `etc/shadow` and
+  `etc/gshadow` for reads, `etc` for changes and `root/.ssh` for both under the bundle's root, which is
+  the container's own overlay mount, so the container's opens hit the marks. Failures are logged, not
+  fatal. The marks are made while the container starts, so its first milliseconds can go unseen.
+- Paths below a home directory or a container root are controlled by the user or the image. The agent
+  resolves them with `openat2` and `RESOLVE_BENEATH | RESOLVE_NO_XDEV | RESOLVE_NO_MAGICLINKS` to an
+  `O_PATH` descriptor, marks the inode through `/proc/self/fd/N` and takes its key from `fstat` of the
+  same descriptor. A symlink that leaves the root or a path that crosses into another mount fails
+  with `EXDEV` and is logged; a link loop fails with `ELOOP`; symlinks inside the root are followed.
+  The previous build resolved these paths in the host namespace and asserted that every failure was
+  `ENOENT`. Reproduced against it: `~/.aws -> /tmp/x` marked `/tmp/x` and recorded its files as
+  `~/.aws`, so a link to `/usr/lib/x86_64-linux-gnu` would put an open mark on every library load
+  on the host; `~/.aws -> .aws` made the agent panic at startup; a FUSE mount at `~/.aws` whose server
+  never answers hung startup with no output. The current build logs all three and starts.
+- New subdirectories: when a watched system directory (not a home directory) reports a created or
+  moved-in subdirectory, the agent marks it with the parent's mask, up to 4096 such directories at a
+  time. This catches `systemctl enable` creating a new `.wants` directory. Files created in the 10 ms
+  before the mark lands are missed. Home directories do not grow: users create directories constantly.
+- Hashes of changed files: a close-after-write or moved-in file in a watched directory is queued to
+  the idle-priority hash worker. The worker opens the path with `O_PATH | O_NOFOLLOW`, which does not
+  call the file's `open` method, and reopens it through `/proc/self/fd/N` with `O_NONBLOCK` only if
+  `fstat` shows a regular file with the event's (dev, inode). A device node moved into a container's
+  `etc` (a container with the default `CAP_MKNOD` can create one; the device cgroup does not apply to
+  the agent) is never opened, and a FIFO or lease cannot stall the worker. Executable hashes use the
+  same open, so replacing an exited program's path with a FIFO no longer stops all later hashing.
 
 Cost of an access to a listed file, open+close of `/etc/shadow` (`bench/results/experiments/marked_open.sh`,
 medians of 5, 488 ns base):
@@ -398,6 +444,9 @@ Hooks that fire only on the operation itself:
 | Namespace creation | `fexit/create_new_namespaces` | types, unshare or clone, new net and mount namespace inodes |
 | setns | `fexit` on the eight `*ns_install` callbacks, which serve both the fd and the pidfd path | type, target namespace inode |
 | User namespace creation | `lsm/userns_create` | euid |
+| Signals | `lsm/task_kill`: user-originated HUP, INT, QUIT, KILL, TERM, STOP to another process | target process key and pid, signal |
+| Secure anonymous inodes (`[userfaultfd]`, `[io_uring]`) | `lsm/inode_init_security_anon` | name |
+| Another process obtaining an fd to one of the agent's maps or programs | `lsm/bpf_map`, `lsm/bpf_prog`, against id sets frozen at startup | object, id, mode |
 
 All LSM programs return 0 on every path: none of them can deny an operation. A `cgroup/sysctl` program
 was rejected because cgroup programs cannot call `bpf_get_current_task_btf` and so cannot fill the actor.
@@ -407,7 +456,14 @@ Volume: a container start on this host (k3s, runc, Cilium CNI) produces about 50
 
 Not observable at these hooks, by design: attempts that fail before the security check
 (`kexec_file_load` with a bad fd, `clock_settime` on a clock that cannot be set), and operations on hot
-paths that are deliberately not hooked: `kill`, `mprotect`, `mmap` with `PROT_EXEC`.
+paths that are deliberately not hooked: `mprotect`, `mmap` with `PROT_EXEC`.
+
+Tampering: the agent's configuration maps (its own object ids, the watched unix sockets) are frozen
+after startup, so `bpf()` cannot change them (`bpftool map update` fails with `EPERM`), and read-only
+settings such as the coalescing window live in `.rodata`, which libbpf freezes. Taking an fd to any of
+the agent's maps or programs, the first step of map-tampering attacks, is recorded, as is a signal
+sent to the agent. Prevention is out of scope; an agent that is killed stops emitting clock records,
+which the collector sees within a second.
 
 ## Decision log
 
@@ -427,23 +483,35 @@ paths that are deliberately not hooked: `kill`, `mprotect`, `mmap` with `PROT_EX
 | 2026-11-02 | Keep fork-time task storage | 246 ns per fork (604 ns with 16 forkers), about 0.2% of a fork+exec; deriving the spawner at exec from `real_parent` loses it on reparenting, the double-fork case |
 | 2026-11-02 | Coalesce sensitive-file events per (process, image, file, mask) per second in the kernel; flush counts with a map iterator | 3.3M-open flood: 3 records and exact counts, 0 drops; Falco: 49% drops, 4% of alerts delivered |
 | 2026-11-02 | Snapshot executable paths from `/proc/<pid>/exe` | Verifier rejects `bpf_d_path` on `mm->exe_file`; trusted-file kfuncs are LSM-only |
+| 2026-11-02 | Record process exits after all (reverses the exit half of the fork/exit row) | Falco, Tetragon, Tracee, Datadog and 8 commercial sensors export exits (`docs/research/`); one record per process, 70 ns |
+| 2026-11-02 | One per-ring busy flag in every class's reserve/commit, instead of split rings for multi-context classes | 52.10 vs 52.29 ns per emitting `getppid` (medians of 11 interleaved pinned runs); safe under any nesting, one code path |
+| 2026-11-02 | Admin operations from LSM hooks and single-purpose kernel functions that fire only on the operation | Coverage pass: 36 of 43 probe actions observed across all classes, before signals and truncation were added; the misses fail before the security check, are unhooked hot paths, or sit outside watched paths |
+| 2026-11-02 | Container metadata from the runtimes' state files, not their APIs | Read once per container; no runtime API calls, no per-record work; docker, containerd, CRI-O, podman |
+| 2026-11-02 | Hash executables and changed files in a `SCHED_IDLE` worker that drops the pages it read | 200 MB binary: 0 bytes left resident (190.8 MB without); 4.07 GB of running binaries in ~25 s of idle time |
+| 2026-11-02 | Persistence and integrity as directory change marks; read marks only on credentials | Catches files created after startup and rename-replacement; `/etc` reads stay unmarked |
+| 2026-11-02 | Unix connects filtered in BPF by target inode | 19 ns per unix connect, the only parity hook that runs for unrelated activity; nothing in the kernel indexes unix connects by target |
+| 2026-11-02 | Do not collect library loads or environment variables | Rule demand 0% and 1.1% (`docs/parity.md`); estimated +0.6% on exec-heavy loads and 1–1.5 µs per exec |
+| 2026-11-02 | Resolve paths under homes and container roots with `openat2(RESOLVE_BENEATH \| RESOLVE_NO_XDEV)`; mark through `/proc/self/fd` | Previous build: a user symlink redirected a mark anywhere on the host, a link loop stopped the agent from starting, a stalled FUSE mount hung it (all reproduced) |
+| 2026-11-02 | Open files to hash with `O_PATH` first and reopen only regular files | `open` on a device node runs its driver (a watchdog arms on open); a container with default `CAP_MKNOD` can place one in its watched `etc` |
+| 2026-11-02 | Key watch state by watch descriptor and drop it on `IN_IGNORED` from the BPF hook | Path and growth maps grew with every container start; the inotify queue can overflow during a flood, the BPF hook sees every removal |
 
 ## Open questions
 
 - Cost of the remaining fexit trampolines. `udp_sendmsg` uses its return value only to skip failed
   sends and size the DNS payload; `fentry` would avoid the call-through. Measure before switching.
-- Whether the per-ring busy flag for multi-context classes costs more than splitting rings by context.
 - Output path: batch size, compression, transport to the collector.
-- Container mark management for sensitive files at container start.
+- NAT module pinning: whether holding `nf_nat` loaded is acceptable on hosts that unload it.
+- Environment variables: whether an idle-priority read of `/proc/<pid>/environ` for long-lived
+  processes is worth its blind spot for short-lived ones.
 
 ## Prototype status
 
 `crates/agent`, binary `panopticon`. `panopticon run <file> [poll-ms]` loads the programs and appends
 the record stream to a file; `panopticon decode <file>` prints one JSON object per record.
 
-Implemented: the proc, net and file classes above, the startup snapshot, clock, loss and repeat
-records, the decoder. Not implemented: nat and admin classes, container metadata and container file
-marks, UDP over IPv6, shipping the stream off the host.
+Implemented: every class above, the startup snapshot, container metadata and container file marks,
+executable and changed-file hashes, clock, loss and repeat records, the decoder. Not implemented:
+shipping the stream off the host.
 
 ### Against Falco
 
@@ -519,8 +587,6 @@ floor there is the trampoline plus the record write.
 
 ### Next
 
-1. nat class, and with it the open question of a busy flag versus split rings for softirq producers.
-2. admin class: the LSM hooks and `cgroup/sysctl` listed above.
-3. Container metadata from the runtime API, and file marks inside containers.
-4. UDP over IPv6.
-5. Shipping the stream off the host.
+1. Shipping the stream off the host.
+2. Attaching the NAT program when `nf_nat` loads after the agent started.
+3. Counting repeat counts lost to coalescing-map evictions, which are now silent.

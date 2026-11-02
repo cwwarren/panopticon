@@ -33,7 +33,7 @@ const WATCH: u32 = wire::REC_WATCH as u32;
 const CONTAINER: u32 = wire::REC_CONTAINER as u32;
 const HASH: u32 = wire::REC_HASH as u32;
 
-const MASKS: [(u32, &str); 14] = [
+const MASKS: [(u32, &str); 15] = [
     (0x1, "access"),
     (0x2, "modify"),
     (0x4, "attrib"),
@@ -46,6 +46,7 @@ const MASKS: [(u32, &str); 14] = [
     (0x200, "delete"),
     (0x400, "delete_self"),
     (0x800, "move_self"),
+    (0x2000, "unmount"),
     (0x0800_0000, "on_child"),
     (0x4000_0000, "dir"),
 ];
