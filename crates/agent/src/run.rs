@@ -284,7 +284,7 @@ enum Sink {
 
 impl Sink {
     fn open(target: &str) -> Self {
-        if target.starts_with("http://") {
+        if target.starts_with("http://") || target.starts_with("https://") {
             return Sink::Otlp(Shipper::new(target));
         }
         File::create(target).unwrap();
@@ -304,8 +304,8 @@ impl Sink {
         if let Sink::Otlp(shipper) = self {
             let s = shipper.finish();
             eprintln!(
-                "otlp: records={} posts={} retries={} lost={}",
-                s.records, s.posts, s.retries, s.lost
+                "otlp: records={} posts={} retries={} lost={} json_bytes={} sent_bytes={}",
+                s.records, s.posts, s.retries, s.lost, s.json, s.sent
             );
         }
     }

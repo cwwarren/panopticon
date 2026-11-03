@@ -309,31 +309,36 @@ The main thread:
   flight, and only then drains the rings and reads the iterator, so nothing committed is left behind.
 - Collect finished hashes from the hashing worker.
 - Hand the buffer to the sink: a file (`panopticon run <file>`, the binary stream `panopticon decode`
-  reads) or an OpenTelemetry collector (`panopticon run http://collector:4318`, see Output).
+  reads) or an OpenTelemetry collector (`panopticon run https://collector:4318`, see Output).
 
 ### Output
 
-`panopticon run http://collector:4318` ships the stream as OTLP/HTTP logs with JSON encoding
-(`POST /v1/logs`), which any OpenTelemetry Collector accepts. Each record becomes one log record:
-`eventName` `pano.<type>`, `timeUnixNano` from the record's jiffies and the latest clock record, and
-the fields `panopticon decode` prints as typed attributes (`intValue`, `stringValue`, `boolValue`,
-arrays for argv, masks and DNS answers, the container flattened to `container.*`, empty strings and
-false flags left out). Resource attributes: `service.name` `panopticon`, `host.name`,
-`panopticon.boot_id`.
+`panopticon run https://collector:4318` (or `http://`) ships the stream as OTLP/HTTP logs with
+gzip-compressed JSON (`POST /v1/logs`), which any OpenTelemetry Collector accepts. Each record
+becomes one log record: `eventName` `pano.<type>`, `timeUnixNano` from the record's jiffies and the
+latest clock record, and the fields `panopticon decode` prints as typed attributes (`intValue`,
+`stringValue`, `boolValue`, arrays for argv, masks and DNS answers, the container flattened to
+`container.*`, empty strings and false flags left out). Resource attributes: `service.name`
+`panopticon`, `host.name`, `panopticon.boot_id`.
 
 - Encoding: a dedicated thread renders records straight into one buffer. Escaping covers only `"`,
   `\` and control bytes, integers are formatted by hand, and no JSON or protobuf library is involved.
   It is the renderer `panopticon decode` uses; `panopticon decode <file> otlp` prints what would be
   sent. One core encodes 1.69 M records/s (2.08 M/s as plain JSON); an OTLP record averages 710 bytes,
   2.3 times the plain JSON.
+- Compression: each request body is gzipped at level 1 (`flate2`, pure Rust). This JSON compresses
+  37 times on a connect flood and 24 times on a mix of exec, file and DNS records, at about 2 GB/s per
+  core; level 6 doubles the ratio at a quarter of the speed.
 - Joins: exec and container records index the executable path and container metadata that later
   records carry. These tables keep two generations of 32,768 entries, and an entry read in the older
   generation moves to the newer, so memory is bounded and long-running processes keep their
   enrichment. Hashes are computed after the exec and arrive as their own `pano.hash` records, keyed
   by dev, inode and ctime.
-- Batching: one POST per second, or at 4 MiB of JSON (the Collector's default limit is 20 MiB). Plain
-  HTTP/1.1 from the standard library, one connection per request, 10 s timeouts. `https://` is not
-  supported: a remote collector sits behind a local one or a proxy.
+- Transport: one POST per second, or at 4 MiB of JSON (the Collector's default limit is 20 MiB), over
+  HTTP/1.1 with `ureq`, one connection per request, 10 s connect, read and write timeouts. `https://`
+  uses rustls and verifies the collector against the host's trust store, which `SSL_CERT_FILE` or
+  `SSL_CERT_DIR` replace; a certificate that does not verify is a transport error like a refused
+  connection.
 - Backpressure: the main thread never waits on the sink. It hands each poll's records to the encoder
   through a queue bounded at 64 MiB; past that it drops whole batches and counts their records.
   Transport errors, 408, 429 and 5xx are retried with backoff doubling to 30 s; any other status drops
@@ -342,9 +347,12 @@ false flags left out). Resource attributes: `service.name` `panopticon`, `host.n
 - Measured against OpenTelemetry Collector v0.164.0 on this host: 717 records sent and 717 parsed,
   attributes typed. With the collector stopped during a 5 s connect flood (849,755 records), the rings
   dropped nothing, 600,091 records were delivered once it came back, and 250,666 were reported lost in
-  one `pano.sink_loss` record; the collector counted 600,092. A sustained 170 k records/s (a connect
-  loop) shipped with no loss at 0.12 agent cores, against 0.005 when writing a file, and 43 MB RSS
-  against 33.
+  one `pano.sink_loss` record; the collector counted 600,092. A sustained 163 k records/s (a connect
+  loop) shipped with no loss: 1,157.7 MB of JSON went out as 31.3 MB and the collector parsed all
+  1,634,723 records. The agent used 0.13–0.14 cores, against 0.115 without gzip and 0.005 writing a
+  file, and 45–47 MB RSS against 44 and 38. Over `https://` with a test CA in `SSL_CERT_FILE`,
+  1,629,901 of 1,629,901 records arrived; without it every request failed with `UnknownIssuer`, and
+  all 171,111 records of that run were reported lost.
 
 ### Containers
 
@@ -642,12 +650,11 @@ emitting `getppid`).
 | 2026-11-02 | Read the flush iterator 16 KiB at a time | Reads that grew past the kernel's 32 KiB iterator buffer re-ran an element after its count was taken: 2 of 3,000 repeat counts lost, 0 of 6,000 at 16 KiB |
 | 2026-11-02 | Startup hash backlog at most 25% of one core | Peak 0.22 → 0.10 cores; the agent runs for the host's lifetime, so a slower first pass costs nothing |
 | 2026-11-02 | Hold `nf_conntrack` loaded while the NAT program is attached | Owner's call: the agent starts with the host and runs the whole time |
+| 2026-11-03 | Gzip every OTLP request at level 1 | 1,157.7 MB of JSON sent as 31.3 MB; 0.13–0.14 agent cores at 163 k records/s against 0.115 uncompressed; level 6 compresses about twice as well at a quarter of the speed |
+| 2026-11-03 | HTTPS through `ureq` and rustls, verified against the host's trust store | The collector parsed 1,629,901 of 1,629,901 records over TLS; a collector certificate from an unknown CA fails every request with `UnknownIssuer`; no OpenSSL dependency. The binary grew from 1.9 to 4.8 MB |
 
 ## Open questions
 
-- Compression: gzip would shrink the ~710 bytes per OTLP record several times over; left out to keep
-  the sender dependency-free.
-- TLS for collectors that are not on the host.
 - Environment variables: whether an idle-priority read of `/proc/<pid>/environ` for long-lived
   processes is worth its blind spot for short-lived ones.
 
@@ -657,8 +664,8 @@ emitting `getppid`).
 the record stream to a file; `panopticon decode <file>` prints one JSON object per record.
 
 Implemented: every class above, the startup snapshot, container metadata and container file marks,
-executable and changed-file hashes, clock, loss and repeat records, the decoder, OTLP shipping. Not
-implemented: TLS and compression for the OTLP sink.
+executable and changed-file hashes, clock, loss and repeat records, the decoder, OTLP shipping over
+HTTP or HTTPS with gzip.
 
 ### Against Falco
 
@@ -788,4 +795,5 @@ Each was fixed; details are in the sections named.
 
 ### Next
 
-1. TLS and compression for the OTLP sink.
+1. Records a collector rejects in an OTLP `partialSuccess` response pass as delivered: the agent
+   reads only the status code.

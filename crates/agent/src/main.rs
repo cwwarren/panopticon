@@ -25,7 +25,7 @@ fn main() {
         ["decode", path, "otlp"] => decode::decode(path, decode::Format::Otlp),
         _ => {
             eprintln!(
-                "usage: panopticon run <file | http://collector:4318> [poll-ms]\n       panopticon decode <file> [otlp]"
+                "usage: panopticon run <file | http[s]://collector:4318[/path]> [poll-ms]\n       panopticon decode <file> [otlp]"
             );
             process::exit(2);
         }

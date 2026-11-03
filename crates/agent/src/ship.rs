@@ -1,10 +1,15 @@
-use std::io::{self, Read, Write};
-use std::net::{TcpStream, ToSocketAddrs};
+use std::io::Write;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering::Relaxed};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender, TrySendError};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
+
+use flate2::Compression;
+use flate2::write::GzEncoder;
+use ureq::Agent;
+use ureq::http::Uri;
+use ureq::tls::{RootCerts, TlsConfig};
 
 use crate::decode::{self, Stream};
 
@@ -37,18 +42,18 @@ pub struct Stats {
     pub posts: u64,
     pub retries: u64,
     pub lost: u64,
+    pub json: u64,
+    pub sent: u64,
 }
 
 struct Endpoint {
-    host: String,
-    port: u16,
-    authority: String,
-    path: String,
+    agent: Agent,
+    url: String,
 }
 
 impl Shipper {
     pub fn new(url: &str) -> Self {
-        let endpoint = Endpoint::parse(url);
+        let endpoint = Endpoint::new(url);
         let (jobs, queue) = mpsc::sync_channel(QUEUE_BATCHES);
         let shared = Arc::new(Shared::default());
         let worker = {
@@ -91,67 +96,62 @@ impl Shipper {
 }
 
 impl Endpoint {
-    fn parse(url: &str) -> Self {
-        let rest = url
-            .strip_prefix("http://")
-            .unwrap_or_else(|| panic!("{url}: only http:// endpoints are supported"));
-        let (authority, path) = match rest.find('/') {
-            Some(i) => (&rest[..i], &rest[i..]),
-            None => (rest, ""),
-        };
-        let (host, port) = match authority.rfind(':') {
-            Some(i) if !authority[i..].contains(']') => (
-                &authority[..i],
-                authority[i + 1..]
-                    .parse()
-                    .unwrap_or_else(|_| panic!("{url}: bad port")),
-            ),
-            _ => (authority, 80),
-        };
+    fn new(url: &str) -> Self {
+        let uri: Uri = url.parse().unwrap_or_else(|err| panic!("{url}: {err}"));
+        assert!(
+            matches!(uri.scheme_str(), Some("http" | "https")),
+            "{url}: expected an http:// or https:// endpoint"
+        );
+        if let Some((_, port)) = uri.authority().and_then(|a| a.as_str().rsplit_once(':'))
+            && !port.ends_with(']')
+        {
+            assert!(port.parse::<u16>().is_ok(), "{url}: bad port");
+        }
+        let agent = Agent::config_builder()
+            .timeout_connect(Some(TIMEOUT))
+            .timeout_per_read(Some(TIMEOUT))
+            .timeout_per_write(Some(TIMEOUT))
+            .http_status_as_error(false)
+            .tls_config(
+                TlsConfig::builder()
+                    .root_certs(RootCerts::PlatformVerifier)
+                    .build(),
+            )
+            .build()
+            .new_agent();
         Endpoint {
-            host: host
-                .trim_start_matches('[')
-                .trim_end_matches(']')
-                .to_string(),
-            port,
-            authority: authority.to_string(),
-            path: if path.is_empty() || path == "/" {
-                "/v1/logs".to_string()
+            agent,
+            url: if uri.path() == "/" {
+                format!("{}/v1/logs", url.trim_end_matches('/'))
             } else {
-                path.to_string()
+                url.to_string()
             },
         }
     }
 
-    fn post(&self, body: &[u8]) -> io::Result<u16> {
-        let addr = (self.host.as_str(), self.port)
-            .to_socket_addrs()?
-            .next()
-            .ok_or_else(|| io::Error::other("no address"))?;
-        let mut stream = TcpStream::connect_timeout(&addr, TIMEOUT)?;
-        stream.set_read_timeout(Some(TIMEOUT))?;
-        stream.set_write_timeout(Some(TIMEOUT))?;
-        let head = format!(
-            "POST {} HTTP/1.1\r\nHost: {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-            self.path,
-            self.authority,
-            body.len()
-        );
-        stream.write_all(head.as_bytes())?;
-        stream.write_all(body)?;
-        let mut response = Vec::new();
-        stream.take(1 << 16).read_to_end(&mut response)?;
-        response
-            .get(9..12)
-            .and_then(|code| std::str::from_utf8(code).ok()?.parse().ok())
-            .ok_or_else(|| io::Error::other("malformed response"))
+    fn post(&self, body: &[u8]) -> Result<u16, ureq::Error> {
+        let response = self
+            .agent
+            .post(&self.url)
+            .header("Content-Type", "application/json")
+            .header("Content-Encoding", "gzip")
+            .send(body)?;
+        Ok(response.status().as_u16())
     }
+}
+
+fn compress(body: &[u8], mut out: Vec<u8>) -> Vec<u8> {
+    out.clear();
+    let mut gzip = GzEncoder::new(out, Compression::fast());
+    gzip.write_all(body).unwrap();
+    gzip.finish().unwrap()
 }
 
 fn ship(endpoint: &Endpoint, queue: &Receiver<Vec<u8>>, shared: &Shared) -> Stats {
     let mut stream = Stream::new();
     let mut records = Vec::with_capacity(BODY_BYTES);
     let mut body = Vec::with_capacity(BODY_BYTES);
+    let mut gzip = Vec::new();
     let mut pending = 0;
     let mut lost = 0;
     let mut stats = Stats::default();
@@ -175,8 +175,11 @@ fn ship(endpoint: &Endpoint, queue: &Receiver<Vec<u8>>, shared: &Shared) -> Stat
         }
         if !records.is_empty() {
             stream.body(&mut body, &records);
-            if deliver(endpoint, &body, shared, &mut stats) {
+            gzip = compress(&body, gzip);
+            if deliver(endpoint, &gzip, shared, &mut stats) {
                 stats.records += pending;
+                stats.json += body.len() as u64;
+                stats.sent += gzip.len() as u64;
                 stats.lost += lost;
                 lost = 0;
             } else {

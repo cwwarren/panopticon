@@ -10,10 +10,12 @@ name = "panopticon"
 path = "src/main.rs"
 
 [dependencies]
+flate2 = "1.1.10"
 libbpf-rs = "0.27.2"
 libc = "0.2.191"
 serde_json = "1"
 sha2 = "0.10"
+ureq = { version = "3.5.1", default-features = false, features = ["rustls", "platform-verifier"] }
 
 [build-dependencies]
 libbpf-cargo = "0.27.2"
