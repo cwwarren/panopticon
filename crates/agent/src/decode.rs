@@ -95,51 +95,25 @@ fn file_key(k: &types::file_key) -> FileKey {
     (k.proc, k.seq, k.ino, k.child_ino, k.dev, k.mask)
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub enum Format {
-    Json,
-    Otlp,
-}
-
-pub fn decode(path: &str, fmt: Format) {
+pub fn decode(path: &str) {
     let data = fs::read(path).unwrap();
     assert_eq!(&data[..8], wire::MAGIC, "not a panopticon stream");
     let data = &data[8..];
     let mut out = BufWriter::new(io::stdout().lock());
     let mut line = Vec::new();
-    match fmt {
-        Format::Json => {
-            let mut decoder = Decoder::new(Format::Json, usize::MAX, true);
-            for (rec, h) in records(data) {
-                decoder.index(rec, &h);
-            }
-            decoder.clocks.sort_unstable();
-            for hashes in decoder.inode_hashes.values_mut() {
-                hashes.sort_unstable();
-            }
-            for (rec, h) in records(data) {
-                line.clear();
-                if decoder.record(rec, &h, &mut line) {
-                    line.push(b'\n');
-                    out.write_all(&line).unwrap();
-                }
-            }
-        }
-        Format::Otlp => {
-            let mut stream = Stream::new();
-            let (mut start, mut end) = (0, 0);
-            for (rec, h) in records(data) {
-                end += rec.len();
-                if u32::from(h.r#type) == CLOCK || end == data.len() {
-                    line.clear();
-                    stream.encode(&data[start..end], &mut line, b'\n');
-                    if !line.is_empty() {
-                        line.push(b'\n');
-                        out.write_all(&line).unwrap();
-                    }
-                    start = end;
-                }
-            }
+    let mut decoder = Decoder::new(usize::MAX, true);
+    for (rec, h) in records(data) {
+        decoder.index(rec, &h);
+    }
+    decoder.clocks.sort_unstable();
+    for hashes in decoder.inode_hashes.values_mut() {
+        hashes.sort_unstable();
+    }
+    for (rec, h) in records(data) {
+        line.clear();
+        if decoder.record(rec, &h, &mut line) {
+            line.push(b'\n');
+            out.write_all(&line).unwrap();
         }
     }
     out.flush().unwrap();
@@ -169,21 +143,19 @@ pub struct Stream {
 impl Stream {
     pub fn new() -> Self {
         Stream {
-            decoder: Decoder::new(Format::Otlp, STREAM_CAP, false),
+            decoder: Decoder::new(STREAM_CAP, false),
         }
     }
 
-    pub fn encode(&mut self, batch: &[u8], out: &mut Vec<u8>, sep: u8) -> u64 {
+    pub fn encode(&mut self, batch: &[u8], out: &mut Vec<u8>) -> u64 {
         for (rec, h) in records(batch) {
             self.decoder.index(rec, &h);
         }
         let mut n = 0;
         for (rec, h) in records(batch) {
             let start = out.len();
-            if start > 0 {
-                out.push(sep);
-            }
             if self.decoder.record(rec, &h, out) {
+                out.push(b'\n');
                 n += 1;
             } else {
                 out.truncate(start);
@@ -194,42 +166,15 @@ impl Stream {
         n
     }
 
-    pub fn loss(&self, out: &mut Vec<u8>, records: u64) {
-        if !out.is_empty() {
-            out.push(b',');
-        }
+    pub fn loss(out: &mut Vec<u8>, records: u64) {
         let ms = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_millis();
-        Obj::new(out, Format::Otlp, "sink_loss", u64::try_from(ms).unwrap())
+        Obj::new(out, "sink_loss", u64::try_from(ms).unwrap())
             .num("records", records)
             .done();
-    }
-
-    pub fn body(&self, out: &mut Vec<u8>, records: &[u8]) {
-        out.clear();
-        out.extend_from_slice(br#"{"resourceLogs":[{"resource":{"attributes":["#);
-        for (i, (key, value)) in [
-            ("service.name", "panopticon"),
-            ("host.name", self.decoder.host.as_str()),
-            ("panopticon.boot_id", self.decoder.boot_id.as_str()),
-        ]
-        .into_iter()
-        .enumerate()
-        {
-            if i > 0 {
-                out.push(b',');
-            }
-            out.extend_from_slice(br#"{"key":""#);
-            out.extend_from_slice(key.as_bytes());
-            out.extend_from_slice(br#"","value":{"stringValue":"#);
-            push_str(out, value);
-            out.extend_from_slice(b"}}");
-        }
-        out.extend_from_slice(br#"]},"scopeLogs":[{"scope":{"name":"panopticon"},"logRecords":["#);
-        out.extend_from_slice(records);
-        out.extend_from_slice(b"]}]}]}");
+        out.push(b'\n');
     }
 }
 
@@ -276,219 +221,127 @@ struct Container {
 
 struct Obj<'a> {
     out: &'a mut Vec<u8>,
-    fmt: Format,
 }
 
 impl<'a> Obj<'a> {
-    fn new(out: &'a mut Vec<u8>, fmt: Format, kind: &str, ts: u64) -> Self {
-        match fmt {
-            Format::Json => {
-                out.extend_from_slice(br#"{"type":""#);
-                out.extend_from_slice(kind.as_bytes());
-                out.extend_from_slice(br#"","ts":"#);
-                push_int(out, ts.into());
-            }
-            Format::Otlp => {
-                out.extend_from_slice(br#"{"timeUnixNano":""#);
-                push_int(out, i128::from(ts) * 1_000_000);
-                out.extend_from_slice(br#"","eventName":"pano."#);
-                out.extend_from_slice(kind.as_bytes());
-                out.extend_from_slice(br#"","attributes":[{"key":"type","value":{"stringValue":""#);
-                out.extend_from_slice(kind.as_bytes());
-                out.extend_from_slice(br#""}}"#);
-            }
-        }
-        Obj { out, fmt }
+    fn new(out: &'a mut Vec<u8>, kind: &str, ts: u64) -> Self {
+        out.extend_from_slice(br#"{"type":""#);
+        out.extend_from_slice(kind.as_bytes());
+        out.extend_from_slice(br#"","ts":"#);
+        push_int(out, ts.into());
+        Obj { out }
     }
 
-    fn open(&mut self, key: &str, otlp: &[u8]) {
-        match self.fmt {
-            Format::Json => {
-                self.out.extend_from_slice(b",\"");
-                self.out.extend_from_slice(key.as_bytes());
-                self.out.extend_from_slice(b"\":");
-            }
-            Format::Otlp => {
-                self.out.extend_from_slice(br#",{"key":""#);
-                self.out.extend_from_slice(key.as_bytes());
-                self.out.extend_from_slice(br#"","value":{"#);
-                self.out.extend_from_slice(otlp);
-            }
-        }
-    }
-
-    fn close(&mut self) {
-        if self.fmt == Format::Otlp {
-            self.out.extend_from_slice(b"}}");
-        }
+    fn open(&mut self, key: &str) {
+        self.out.extend_from_slice(b",\"");
+        self.out.extend_from_slice(key.as_bytes());
+        self.out.extend_from_slice(b"\":");
     }
 
     fn num(mut self, key: &str, value: impl Into<i128>) -> Self {
-        let quoted = self.fmt == Format::Otlp;
-        self.open(key, br#""intValue":"#);
-        if quoted {
-            self.out.push(b'"');
-        }
+        self.open(key);
         push_int(self.out, value.into());
-        if quoted {
-            self.out.push(b'"');
-        }
-        self.close();
         self
     }
 
     fn flag(mut self, key: &str, value: bool) -> Self {
-        if self.fmt == Format::Otlp && !value {
-            return self;
-        }
-        self.open(key, br#""boolValue":"#);
-        self.out
-            .extend_from_slice(if value { b"true" } else { b"false" });
-        self.close();
+        self.open(key);
+        push_bool(self.out, value);
         self
     }
 
     fn str(mut self, key: &str, value: &str) -> Self {
-        if self.fmt == Format::Otlp && value.is_empty() {
-            return self;
-        }
-        self.open(key, br#""stringValue":"#);
+        self.open(key);
         push_str(self.out, value);
-        self.close();
         self
     }
 
     fn with(mut self, key: &str, ascii: impl FnOnce(&mut Vec<u8>)) -> Self {
-        self.open(key, br#""stringValue":"#);
+        self.open(key);
         self.out.push(b'"');
         ascii(self.out);
         self.out.push(b'"');
-        self.close();
         self
     }
 
     fn array<T>(
         mut self,
         key: &str,
-        otlp: &[u8],
         items: impl IntoIterator<Item = T>,
         mut push: impl FnMut(&mut Vec<u8>, T),
     ) -> Self {
-        let wrap = self.fmt == Format::Otlp;
-        self.open(key, br#""arrayValue":{"values":"#);
+        self.open(key);
         self.out.push(b'[');
         for (i, item) in items.into_iter().enumerate() {
             if i > 0 {
                 self.out.push(b',');
             }
-            if wrap {
-                self.out.push(b'{');
-                self.out.extend_from_slice(otlp);
-            }
             push(self.out, item);
-            if wrap {
-                self.out.push(b'}');
-            }
         }
         self.out.push(b']');
-        if wrap {
-            self.out.push(b'}');
-        }
-        self.close();
         self
     }
 
     fn strs<S: AsRef<str>>(self, key: &str, items: impl IntoIterator<Item = S>) -> Self {
-        self.array(key, br#""stringValue":"#, items, |out, s| {
-            push_str(out, s.as_ref());
-        })
+        self.array(key, items, |out, s| push_str(out, s.as_ref()))
     }
 
     fn nums(self, key: &str, items: &[u64]) -> Self {
-        let quoted = self.fmt == Format::Otlp;
-        self.array(key, br#""intValue":"#, items, |out, &v| {
-            if quoted {
-                out.push(b'"');
-            }
-            push_int(out, v.into());
-            if quoted {
-                out.push(b'"');
-            }
-        })
+        self.array(key, items, |out, &v| push_int(out, v.into()))
     }
 
     fn bools(self, key: &str, items: &[bool]) -> Self {
-        self.array(key, br#""boolValue":"#, items, |out, &v| {
-            out.extend_from_slice(if v { b"true" } else { b"false" });
-        })
+        self.array(key, items, |out, &v| push_bool(out, v))
     }
 
     fn container(mut self, c: Option<&Container>) -> Self {
-        let bit = |c: &Container, b: u8| c.flags & b != 0;
-        match (self.fmt, c) {
-            (Format::Json, None) => {
-                self.open("container", b"");
-                self.out.extend_from_slice(b"null");
-                self
+        self.open("container");
+        let Some(c) = c else {
+            self.out.extend_from_slice(b"null");
+            return self;
+        };
+        self.out.push(b'{');
+        for (i, (k, v)) in [
+            ("runtime", &c.runtime),
+            ("id", &c.id),
+            ("name", &c.name),
+            ("image", &c.image),
+            ("pod", &c.pod),
+            ("namespace", &c.namespace),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            if i > 0 {
+                self.out.push(b',');
             }
-            (Format::Json, Some(c)) => {
-                self.open("container", b"");
-                self.out.push(b'{');
-                for (i, (k, v)) in [
-                    ("runtime", &c.runtime),
-                    ("id", &c.id),
-                    ("name", &c.name),
-                    ("image", &c.image),
-                    ("pod", &c.pod),
-                    ("namespace", &c.namespace),
-                ]
-                .into_iter()
-                .enumerate()
-                {
-                    if i > 0 {
-                        self.out.push(b',');
-                    }
-                    self.out.push(b'"');
-                    self.out.extend_from_slice(k.as_bytes());
-                    self.out.extend_from_slice(b"\":");
-                    push_str(self.out, v);
-                }
-                for (k, b) in [
-                    ("privileged", container::PRIVILEGED),
-                    ("host_pid", container::HOST_PID),
-                    ("host_net", container::HOST_NET),
-                    ("sandbox", container::SANDBOX),
-                ] {
-                    self.out.extend_from_slice(b",\"");
-                    self.out.extend_from_slice(k.as_bytes());
-                    self.out.extend_from_slice(b"\":");
-                    self.out
-                        .extend_from_slice(if bit(c, b) { b"true" } else { b"false" });
-                }
-                self.out.push(b'}');
-                self
-            }
-            (Format::Otlp, None) => self,
-            (Format::Otlp, Some(c)) => self
-                .str("container.runtime", &c.runtime)
-                .str("container.id", &c.id)
-                .str("container.name", &c.name)
-                .str("container.image", &c.image)
-                .str("container.pod", &c.pod)
-                .str("container.namespace", &c.namespace)
-                .flag("container.privileged", bit(c, container::PRIVILEGED))
-                .flag("container.host_pid", bit(c, container::HOST_PID))
-                .flag("container.host_net", bit(c, container::HOST_NET))
-                .flag("container.sandbox", bit(c, container::SANDBOX)),
+            self.out.push(b'"');
+            self.out.extend_from_slice(k.as_bytes());
+            self.out.extend_from_slice(b"\":");
+            push_str(self.out, v);
         }
+        for (k, b) in [
+            ("privileged", container::PRIVILEGED),
+            ("host_pid", container::HOST_PID),
+            ("host_net", container::HOST_NET),
+            ("sandbox", container::SANDBOX),
+        ] {
+            self.out.extend_from_slice(b",\"");
+            self.out.extend_from_slice(k.as_bytes());
+            self.out.extend_from_slice(b"\":");
+            push_bool(self.out, c.flags & b != 0);
+        }
+        self.out.push(b'}');
+        self
     }
 
     fn done(self) {
-        match self.fmt {
-            Format::Json => self.out.push(b'}'),
-            Format::Otlp => self.out.extend_from_slice(b"]}"),
-        }
+        self.out.push(b'}');
     }
+}
+
+fn push_bool(out: &mut Vec<u8>, v: bool) {
+    out.extend_from_slice(if v { b"true" } else { b"false" });
 }
 
 fn push_int(out: &mut Vec<u8>, v: i128) {
@@ -658,13 +511,10 @@ fn meta_rec(rec: &[u8]) -> (u32, u32, String, String) {
 }
 
 struct Decoder {
-    fmt: Format,
     joins: bool,
     clocks: Vec<(u64, u64)>,
     boot_to_real_ms: i128,
     hz: u64,
-    host: String,
-    boot_id: String,
     images: Gen<(u64, u64), String>,
     watches: Gen<(u32, u64), String>,
     files: Gen<FileKey, (types::actor, String)>,
@@ -675,15 +525,12 @@ struct Decoder {
 }
 
 impl Decoder {
-    fn new(fmt: Format, cap: usize, joins: bool) -> Self {
+    fn new(cap: usize, joins: bool) -> Self {
         Decoder {
-            fmt,
             joins,
             clocks: Vec::new(),
             boot_to_real_ms: 0,
             hz: 0,
-            host: String::new(),
-            boot_id: String::new(),
             images: Gen::new(cap),
             watches: Gen::new(cap),
             files: Gen::new(cap),
@@ -706,12 +553,7 @@ impl Decoder {
                 self.boot_to_real_ms =
                     i128::from(realtime / 1_000_000) - i128::from(boottime / 1_000_000);
             }
-            META => {
-                let (_, hz, boot_id, host) = meta_rec(rec);
-                self.hz = u64::from(hz);
-                self.boot_id = boot_id;
-                self.host = host;
-            }
+            META => self.hz = u64::from(meta_rec(rec).1),
             PATH => {
                 let r: types::path_rec = read(rec);
                 let raw = &rec[size_of::<types::path_rec>()..][..usize::from(r.len)];
@@ -791,12 +633,11 @@ impl Decoder {
 
     fn record(&mut self, rec: &[u8], h: &types::rec_hdr, out: &mut Vec<u8>) -> bool {
         let ts = self.ts(h.jiffies);
-        let fmt = self.fmt;
         match u32::from(h.r#type) {
             CLOCK => return false,
             META => {
                 let (ncpus, hz, boot_id, host) = meta_rec(rec);
-                Obj::new(out, fmt, "meta", ts)
+                Obj::new(out, "meta", ts)
                     .num("ncpus", ncpus)
                     .num("hz", hz)
                     .str("boot_id", &boot_id)
@@ -806,7 +647,7 @@ impl Decoder {
             PATH => {
                 let r: types::path_rec = read(rec);
                 let raw = &rec[size_of::<types::path_rec>()..][..usize::from(r.len)];
-                Obj::new(out, fmt, "path", ts)
+                Obj::new(out, "path", ts)
                     .with("dev", |o| push_dev(o, r.dev))
                     .num("ino", r.ino)
                     .str("path", &path_text(raw))
@@ -814,7 +655,7 @@ impl Decoder {
             }
             HASH => {
                 let ((dev_id, ino, ctime), size, digest) = hash_rec(rec);
-                Obj::new(out, fmt, "hash", ts)
+                Obj::new(out, "hash", ts)
                     .with("dev", |o| push_dev(o, dev_id))
                     .num("ino", ino)
                     .num("ctime", ctime)
@@ -824,7 +665,7 @@ impl Decoder {
             }
             CONTAINER => {
                 let (cgroup, c) = container_rec(rec);
-                Obj::new(out, fmt, "container", ts)
+                Obj::new(out, "container", ts)
                     .num("cgroup", cgroup)
                     .container(Some(&c))
                     .done();
@@ -836,7 +677,7 @@ impl Decoder {
                     read(&rec[wire::HDR + 8..]),
                 );
                 let path = text(&rec[wire::HDR + 16..]);
-                Obj::new(out, fmt, "watch", ts)
+                Obj::new(out, "watch", ts)
                     .str("path", path.trim_end_matches('\0'))
                     .with("dev", |o| push_dev(o, d))
                     .num("ino", ino)
@@ -849,7 +690,7 @@ impl Decoder {
                     read(&rec[wire::HDR + 4..]),
                     read(&rec[wire::HDR + 8..]),
                 );
-                Obj::new(out, fmt, "loss", ts)
+                Obj::new(out, "loss", ts)
                     .num("class", class)
                     .num("cpu", cpu)
                     .num("drops", drops)
@@ -859,7 +700,7 @@ impl Decoder {
                 let count: u64 = read(&rec[wire::HDR..]);
                 let name = &rec[wire::HDR + 8..];
                 let name = &name[..name.iter().position(|&b| b == 0).unwrap_or(name.len())];
-                Obj::new(out, fmt, "miss", ts)
+                Obj::new(out, "miss", ts)
                     .str("prog", &text(name))
                     .num("count", count)
                     .done();
@@ -868,7 +709,7 @@ impl Decoder {
             CGROUP => {
                 let r: types::cgroup_rec = read(rec);
                 let body = &rec[size_of::<types::cgroup_rec>()..];
-                Obj::new(out, fmt, "cgroup", ts)
+                Obj::new(out, "cgroup", ts)
                     .num("id", r.id)
                     .str("path", &text(&body[..usize::from(r.path_len)]))
                     .done();
@@ -888,7 +729,7 @@ impl Decoder {
                     None
                 };
                 let obj = self
-                    .actor(Obj::new(out, fmt, "file", ts), &r.a)
+                    .actor(Obj::new(out, "file", ts), &r.a)
                     .str("name", &name);
                 self.file(obj, &r.k)
                     .flag("saturated", h.flags & SATURATED != 0)
@@ -901,7 +742,7 @@ impl Decoder {
                     .files
                     .get(&file_key(&r.k))
                     .map(|(a, name)| (*a, name.clone()));
-                let obj = Obj::new(out, fmt, "file_repeat", ts).num("count", r.count);
+                let obj = Obj::new(out, "file_repeat", ts).num("count", r.count);
                 let obj = match known {
                     Some((a, name)) => self.actor(obj, &a).str("name", &name),
                     None => obj.num("proc", r.k.proc),
@@ -912,7 +753,7 @@ impl Decoder {
                 let r: types::exit_rec = read(rec);
                 let code = r.exit_code;
                 let obj = self
-                    .actor(Obj::new(out, fmt, "exit", ts), &r.a)
+                    .actor(Obj::new(out, "exit", ts), &r.a)
                     .num(
                         "start",
                         i128::from(r.start_boottime / 1_000_000) + self.boot_to_real_ms,
@@ -928,7 +769,7 @@ impl Decoder {
             }
             LOGIN => {
                 let r: types::login_rec = read(rec);
-                self.actor(Obj::new(out, fmt, "login", ts), &r.a)
+                self.actor(Obj::new(out, "login", ts), &r.a)
                     .num("loginuid", r.loginuid)
                     .num("sessionid", r.sessionid)
                     .done();
@@ -942,7 +783,7 @@ impl Decoder {
                     17 => "packet",
                     _ => "other",
                 };
-                self.actor(Obj::new(out, fmt, "raw_socket", ts), &r.a)
+                self.actor(Obj::new(out, "raw_socket", ts), &r.a)
                     .str("family", family)
                     .num("sock_type", r.r#type)
                     .with("protocol", |o| push_hex(o, r.protocol.into()))
@@ -956,7 +797,7 @@ impl Decoder {
                     .get(&(r.dev, r.ino))
                     .cloned()
                     .unwrap_or_default();
-                self.actor(Obj::new(out, fmt, "unix_connect", ts), &r.a)
+                self.actor(Obj::new(out, "unix_connect", ts), &r.a)
                     .str("path", &path)
                     .with("dev", |o| push_dev(o, r.dev))
                     .num("ino", r.ino)
@@ -964,7 +805,7 @@ impl Decoder {
             }
             NAT => {
                 let r: types::nat_rec = read(rec);
-                Obj::new(out, fmt, "nat", ts)
+                Obj::new(out, "nat", ts)
                     .str(
                         "manip",
                         match r.manip {
@@ -1014,7 +855,7 @@ impl Decoder {
             .images
             .get(&(r.prev_image_proc, r.prev_image_seq))
             .map_or("", String::as_str);
-        let obj = Obj::new(out, self.fmt, kind, ts)
+        let obj = Obj::new(out, kind, ts)
             .num("proc", r.proc)
             .num("seq", r.exec_seq)
             .num("spawner", r.spawner)
@@ -1082,7 +923,7 @@ impl Decoder {
                 .filter(move |(bit, _)| flags & bit != 0)
                 .map(|(_, n)| *n)
         };
-        let obj = self.actor(Obj::new(out, self.fmt, "admin", ts), &r.a);
+        let obj = self.actor(Obj::new(out, "admin", ts), &r.a);
         let obj = match op(r.op) {
             op::ADMIN_MODULE_FILE => obj
                 .str("op", "module_load")
@@ -1206,7 +1047,7 @@ impl Decoder {
             _ => "dns_answer",
         };
         let obj = self
-            .actor(Obj::new(out, self.fmt, kind, ts), &r.a)
+            .actor(Obj::new(out, kind, ts), &r.a)
             .num("proto", r.proto)
             .with("src", |o| push_addr(o, r.family, &r.saddr, r.sport))
             .with("dst", |o| push_addr(o, r.family, &r.daddr, r.dport))

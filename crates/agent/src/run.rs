@@ -279,13 +279,13 @@ pub fn run(out_path: &str, poll: Duration) {
 
 enum Sink {
     File(File),
-    Otlp(Shipper),
+    Collector(Shipper),
 }
 
 impl Sink {
     fn open(target: &str) -> Self {
-        if target.starts_with("http://") || target.starts_with("https://") {
-            return Sink::Otlp(Shipper::new(target));
+        if target.starts_with("https://") {
+            return Sink::Collector(Shipper::new(target));
         }
         File::create(target).unwrap();
         let mut file = fs::OpenOptions::new().append(true).open(target).unwrap();
@@ -296,16 +296,16 @@ impl Sink {
     fn write(&mut self, buf: &[u8]) {
         match self {
             Sink::File(file) => file.write_all(buf).unwrap(),
-            Sink::Otlp(shipper) => shipper.push(buf),
+            Sink::Collector(shipper) => shipper.push(buf),
         }
     }
 
     fn finish(self) {
-        if let Sink::Otlp(shipper) = self {
+        if let Sink::Collector(shipper) = self {
             let s = shipper.finish();
             eprintln!(
-                "otlp: records={} posts={} retries={} lost={} json_bytes={} sent_bytes={}",
-                s.records, s.posts, s.retries, s.lost, s.json, s.sent
+                "collector: records={} batches={} puts={} retries={} lost={} json_bytes={} sent_bytes={}",
+                s.records, s.batches, s.puts, s.retries, s.lost, s.json, s.sent
             );
         }
     }

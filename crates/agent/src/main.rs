@@ -21,11 +21,10 @@ fn main() {
     match args.as_slice() {
         ["run", out] => run::run(out, Duration::from_millis(10)),
         ["run", out, poll_ms] => run::run(out, Duration::from_millis(poll_ms.parse().unwrap())),
-        ["decode", path] => decode::decode(path, decode::Format::Json),
-        ["decode", path, "otlp"] => decode::decode(path, decode::Format::Otlp),
+        ["decode", path] => decode::decode(path),
         _ => {
             eprintln!(
-                "usage: panopticon run <file | http[s]://collector:4318[/path]> [poll-ms]\n       panopticon decode <file> [otlp]"
+                "usage: panopticon run <file | https://collector:8443> [poll-ms]\n       panopticon decode <file>"
             );
             process::exit(2);
         }

@@ -309,50 +309,71 @@ The main thread:
   flight, and only then drains the rings and reads the iterator, so nothing committed is left behind.
 - Collect finished hashes from the hashing worker.
 - Hand the buffer to the sink: a file (`panopticon run <file>`, the binary stream `panopticon decode`
-  reads) or an OpenTelemetry collector (`panopticon run https://collector:4318`, see Output).
+  reads) or the collector (`panopticon run https://collector:8443`, see Output).
 
 ### Output
 
-`panopticon run https://collector:4318` (or `http://`) ships the stream as OTLP/HTTP logs with
-gzip-compressed JSON (`POST /v1/logs`), which any OpenTelemetry Collector accepts. Each record
-becomes one log record: `eventName` `pano.<type>`, `timeUnixNano` from the record's jiffies and the
-latest clock record, and the fields `panopticon decode` prints as typed attributes (`intValue`,
-`stringValue`, `boolValue`, arrays for argv, masks and DNS answers, the container flattened to
-`container.*`, empty strings and false flags left out). Resource attributes: `service.name`
-`panopticon`, `host.name`, `panopticon.boot_id`.
+`panopticon run https://collector:8443` sends the stream to `panopticon-collector`
+(`crates/collector`), which writes it to S3. Records travel as JSON lines, the format
+`panopticon decode` prints, gzipped, one batch a minute.
 
-- Encoding: a dedicated thread renders records straight into one buffer. Escaping covers only `"`,
-  `\` and control bytes, integers are formatted by hand, and no JSON or protobuf library is involved.
-  It is the renderer `panopticon decode` uses; `panopticon decode <file> otlp` prints what would be
-  sent. One core encodes 1.69 M records/s (2.08 M/s as plain JSON); an OTLP record averages 710 bytes,
-  2.3 times the plain JSON.
-- Compression: each request body is gzipped at level 1 (`flate2`, pure Rust). This JSON compresses
-  37 times on a connect flood and 24 times on a mix of exec, file and DNS records, at about 2 GB/s per
-  core; level 6 doubles the ratio at a quarter of the speed.
+- Encoding: a dedicated thread renders records straight into a buffer. Escaping covers only `"`,
+  `\` and control bytes, integers are formatted by hand, and no JSON library is involved; one core
+  encodes 2.08 M records/s. The same thread gzips the lines as they arrive (level 1, `flate2`): 15
+  times on a mix of exec, file, DNS and connect records (387 bytes of JSON per record), 30 times on a
+  connect flood. Level 6 compresses about twice as well at a quarter of the speed.
 - Joins: exec and container records index the executable path and container metadata that later
   records carry. These tables keep two generations of 32,768 entries, and an entry read in the older
   generation moves to the newer, so memory is bounded and long-running processes keep their
-  enrichment. Hashes are computed after the exec and arrive as their own `pano.hash` records, keyed
-  by dev, inode and ctime.
-- Transport: one POST per second, or at 4 MiB of JSON (the Collector's default limit is 20 MiB), over
-  HTTP/1.1 with `ureq`, one connection per request, 10 s connect, read and write timeouts. `https://`
-  uses rustls and verifies the collector against the host's trust store, which `SSL_CERT_FILE` or
-  `SSL_CERT_DIR` replace; a certificate that does not verify is a transport error like a refused
-  connection.
-- Backpressure: the main thread never waits on the sink. It hands each poll's records to the encoder
-  through a queue bounded at 64 MiB; past that it drops whole batches and counts their records.
-  Transport errors, 408, 429 and 5xx are retried with backoff doubling to 30 s; any other status drops
-  the batch. Every loss is reported in the next delivered batch as a `pano.sink_loss` record with the
-  record count, next to the kernel side's `loss` and `miss` records.
-- Measured against OpenTelemetry Collector v0.164.0 on this host: 717 records sent and 717 parsed,
-  attributes typed. With the collector stopped during a 5 s connect flood (849,755 records), the rings
-  dropped nothing, 600,091 records were delivered once it came back, and 250,666 were reported lost in
-  one `pano.sink_loss` record; the collector counted 600,092. A sustained 163 k records/s (a connect
-  loop) shipped with no loss: 1,157.7 MB of JSON went out as 31.3 MB and the collector parsed all
-  1,634,723 records. The agent used 0.13–0.14 cores, against 0.115 without gzip and 0.005 writing a
-  file, and 45–47 MB RSS against 44 and 38. Over `https://` with a test CA in `SSL_CERT_FILE`,
-  1,629,901 of 1,629,901 records arrived; without it every request failed with `UnknownIssuer`, and
-  all 171,111 records of that run were reported lost.
+  enrichment. Hashes are computed after the exec and arrive as their own `hash` records, keyed by
+  dev, inode and ctime.
+- Batches: a batch closes every 60 s, or at 8 MiB of gzip, and is sent even when empty, so an
+  object a minute shows the agent alive. It goes out as `PUT /<run>/<seq>` with the gzip as the
+  body: `run` is the agent's start time in nanoseconds and `seq` counts batches from 0. The minute is
+  a cost choice: the collector writes one S3 object per batch, about 43,000 PUT requests per host per
+  month.
+- Authentication: mutual TLS 1.3 over rustls. The agent presents `/etc/panopticon/cert.pem` and
+  `key.pem` and trusts only `ca.pem` for the collector; the collector accepts client certificates
+  from its `/etc/panopticon-collector/ca.pem` and names every object after the first DNS name in the
+  verified certificate. Records carry no identity of their own: the object key does, and only the
+  collector can write keys. A certificate without a DNS name gets 403.
+- Storage: the collector answers 200 only once S3 holds the object, at
+  `<prefix>/<host>/<run>/<seq>.jsonl.gz`. The PUT carries `If-None-Match: *`, so a retry of a stored
+  batch gets S3's 412, which the collector answers with 200, and no one, a host holding its own key
+  included, can replace a stored batch. Any S3 failure becomes 503. The collector keeps no state
+  between requests and nothing on disk, so several can sit behind a TCP load balancer. It signs S3
+  requests itself (SigV4 over `hmac` and `sha2`, path-style URLs) with `AWS_ACCESS_KEY_ID` and
+  `AWS_SECRET_ACCESS_KEY` or, without them, the EC2 instance role through IMDSv2, refreshed every 5
+  minutes; `AWS_REGION` is required and `AWS_ENDPOINT_URL_S3` selects another S3 implementation.
+- Limits: 64 workers, so at most 64 bodies of at most 16 MiB in memory; further connections wait in
+  the listen backlog. Each socket read and write times out after 30 s, so a client that stalls,
+  before authenticating included, holds a worker that long: the collector belongs on a private
+  network.
+- Backpressure and loss: the main thread never waits on the network. Raw records queue up to 64 MiB
+  for the encoder and closed batches up to 64 MiB of gzip for the sender (about 1 GB of JSON at 15
+  times); past either bound a batch is dropped. Transport errors, 408, 429 and 5xx are retried with
+  backoff doubling to 30 s; any other status drops the batch. Every loss is reported as a
+  `sink_loss` record with the record count at the start of the next batch, and a dropped batch
+  leaves a gap in `seq`. Batches still in memory are lost if the agent dies; nothing is spooled to
+  disk.
+
+Measured on this host with Versity S3 Gateway (posix backend on tmpfs) as S3:
+
+| Case | Result |
+|---|---|
+| 10 s connect flood, 300 execs, 100 `/etc/shadow` reads | 1,707,545 records in 3 objects holding 1,707,545 lines; 526.9 MB of JSON stored as 17.7 MB |
+| Collector down for the first 15 s | 4 refused connections retried; 1,712,024 of 1,712,024 stored |
+| S3 down for the first 15 s | 4 answers of 503 retried; 1,589,795 of 1,589,795 stored |
+| Collector down for 65 s of a 60 s flood | 6,273,549 stored in 8 objects; 3,222,581 dropped when the pending bound filled, reported by one `sink_loss` record (3,222,581) in the next batch; `seq` 7–10 missing |
+| Second PUT of a stored `(run, seq)` with other content | 200, first content kept |
+| No client certificate; one from another CA | TLS alert `certificate_required`; `unknown_ca` |
+| Certificate without a DNS name | 403 |
+| Wrong S3 secret | S3 403, collector 503 |
+| Agent at 165 k records/s | 0.11 cores and 46 MB RSS, against 0.005 and 38 MB writing a file |
+| Collector, 16 clients | 0.34 ms CPU per 256 KiB batch, 5.9 ms per 8 MiB batch, 26 MB RSS; 935 batches/s at 0.32 cores, the S3 gateway and the clients setting the rate |
+
+Instance-role credentials were fetched from a stand-in IMDSv2, but this S3 gateway rejects every
+session token, so writing with them is untested against AWS.
 
 ### Containers
 
@@ -652,6 +673,10 @@ emitting `getppid`).
 | 2026-11-02 | Hold `nf_conntrack` loaded while the NAT program is attached | Owner's call: the agent starts with the host and runs the whole time |
 | 2026-11-03 | Gzip every OTLP request at level 1 | 1,157.7 MB of JSON sent as 31.3 MB; 0.13–0.14 agent cores at 163 k records/s against 0.115 uncompressed; level 6 compresses about twice as well at a quarter of the speed |
 | 2026-11-03 | HTTPS through `ureq` and rustls, verified against the host's trust store | The collector parsed 1,629,901 of 1,629,901 records over TLS; a collector certificate from an unknown CA fails every request with `UnknownIssuer`; no OpenSSL dependency. The binary grew from 1.9 to 4.8 MB |
+| 2026-11-04 | Replace OTLP with our own collector: mutual-TLS `PUT` of gzipped JSON-lines batches, written to S3 | OTLP names the source with whatever the sender claims; the collector names every object after the verified client certificate, in 430 lines of Rust |
+| 2026-11-04 | One batch a minute, sent even when empty | One S3 PUT per batch: about 43,000 a month per host against 2.6 M at one a second; the steady object stream shows the agent alive |
+| 2026-11-04 | Key objects by host, agent run and batch sequence, written with `If-None-Match: *` | Retries store a batch once and nothing replaces a stored batch: a second PUT with other content returned 200 and kept the first |
+| 2026-11-04 | No disk spool in the agent | 64 MiB of gzip in memory holds about 1 GB of JSON; a spool would add crash recovery and files an attacker on the host can edit |
 
 ## Open questions
 
@@ -664,8 +689,8 @@ emitting `getppid`).
 the record stream to a file; `panopticon decode <file>` prints one JSON object per record.
 
 Implemented: every class above, the startup snapshot, container metadata and container file marks,
-executable and changed-file hashes, clock, loss and repeat records, the decoder, OTLP shipping over
-HTTP or HTTPS with gzip.
+executable and changed-file hashes, clock, loss and repeat records, the decoder, shipping to the
+collector, and the collector.
 
 ### Against Falco
 
@@ -795,5 +820,8 @@ Each was fixed; details are in the sections named.
 
 ### Next
 
-1. Records a collector rejects in an OTLP `partialSuccess` response pass as delivered: the agent
-   reads only the status code.
+1. Revocation: the collector accepts every unexpired certificate its CA issued, so cutting off one
+   host needs short-lived certificates or a CRL (rustls can check CRLs).
+2. Issuing host certificates. On EC2 an issuer can bind a certificate's DNS name to the instance ID
+   after verifying the instance identity document.
+3. Writing to AWS S3 with instance-role credentials.
