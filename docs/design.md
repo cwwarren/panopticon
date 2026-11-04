@@ -156,8 +156,9 @@ One hook on `nf_nat_setup_info` captured Docker and k3s pod translations for TCP
 ### Identity
 
 `struct pid` carries a 64-bit pidfs inode. BPF `task->group_leader->thread_pid->ino` equals userspace
-`fstat(pidfd_open(pid)).st_ino` (verified 3/3). On 64-bit kernels it comes from a cookie allocator:
-unique per boot, never reused, not monotonic across CPUs.
+`fstat(pidfd_open(pid)).st_ino` (verified 3/3). On 64-bit 7.0 it comes from a cookie allocator: unique
+per boot, never reused, not monotonic across CPUs. On 6.18 it comes from a global counter under
+`pidmap_lock` (`pidfs_add_pid()`): also unique per boot and never reused, and monotonic.
 
 ## Architecture
 
@@ -196,8 +197,15 @@ Fork produces no records. Process exit produces one record when the last thread 
   by a fork-only child (a subshell, a double-forked daemon) to the program it was running, without
   fork records. Mode, link count and filesystem make setuid binaries, deleted executables and memfd
   execution (`nlink` 0 on tmpfs) visible without extra hooks; the upper-layer flag marks a container
-  running a binary it wrote or modified (drift, read through CO-RE on `ovl_inode` and skipped when
-  the overlay module's BTF is absent); socket stdio marks reverse shells.
+  running a binary it wrote or modified (drift, read through CO-RE on `ovl_inode`, a type in the
+  overlay module's BTF, which CO-RE resolves only when the object loads). Container runtimes usually
+  start after the agent, so if `overlay` is missing from `/proc/filesystems` the agent calls
+  `fsopen("overlay")` once before loading, which makes the kernel load the module, and logs
+  `overlay: loaded module`. The side effect is overlayfs loaded on a host that may never mount it; any
+  user can trigger the same autoload with an overlay mount in a user namespace. Without it, an agent
+  started first reported every container exec as not upper-layer for its whole lifetime (reproduced on
+  6.18: a binary copied into the container's upper layer and run had `exe_upper` false; true with
+  the autoload, and when overlayfs was loaded before the agent). Socket stdio marks reverse shells.
 - Working directory: the exec record carries the directory's (dev, inode). The first exec in a
   directory not seen recently (LRU set of 4096) also emits a path record from a bounded dentry walk
   that crosses mounts up to the namespace root, so the path is container-relative inside containers.
@@ -283,8 +291,25 @@ Safety comes from the same structure that makes it fast:
   stay inside the map value, so this is a code invariant, not a verifier guarantee; the formal model
   shows that one byte past `max` overwrites the oldest unread record.
 
-Kernel requirements: `bpf_preempt_disable` (6.10), BPF load-acquire/store-release (6.15), BPF LSM,
-task and socket local storage.
+Kernel requirements: 6.18 or later, verified on 7.0 (the reference host) and on 6.18.56 (Amazon Linux
+2023 `kernel6.18`): every program loads and attaches, and the `loadgen act` probes plus a short
+`loadgen bench` of each workload record in every class. The transport needs `bpf_preempt_disable`
+(6.10) and BPF load-acquire/store-release (6.15); the hooks need `sched_process_exit`'s `group_dead`
+argument (6.16), so 6.15 cannot load `on_exit`; 6.16 and 6.17 are untested. Also the BPF LSM active
+(`bpf` in `/sys/kernel/security/lsm`), `CONFIG_DEBUG_INFO_BTF` and `CONFIG_DEBUG_INFO_BTF_MODULES`
+(`nf_conntrack` and `overlay` are modules on both kernels), task and socket local storage. Building
+needs clang 21 or later for load-acquire/store-release: clang 15, 18 and 20 reject `-mcpu=v4` or the
+acquire load. `build.rs` generates `vmlinux.h` from the build host's BTF; objects built against 6.18
+or 7.0 load on both (verified both ways), because the 6.19 compressed-module ids are resolved by name
+at load time.
+
+Amazon Linux 2023: the default kernel is 6.1, which is not supported. Install `kernel6.18`, make it
+the default (`grubby --set-default /boot/vmlinuz-6.18.*`) and reboot. No boot parameter is needed: its
+`CONFIG_LSM` lists `bpf`, and the stock `security=selinux` only disables the other major LSMs, so the
+active list is `lockdown,capability,landlock,yama,safesetid,selinux,bpf,ima`; lockdown is `none`.
+Build in an AL2023 userland (glibc 2.34) with the `clang22` or `clang21` package; the default `clang`
+is 15. The kernel runs at `HZ=100`, so record times have 10 ms resolution, and boots
+`PREEMPT_DYNAMIC` as `none`.
 
 All classes use the same mechanism. Sharing one ring between low-rate classes would save a few MB and
 add a second code path.
@@ -568,7 +593,7 @@ Hooks that fire only on the operation itself:
 
 | Operation | Hook | Recorded |
 |---|---|---|
-| Module load from a file, including compressed modules | `lsm.s/kernel_read_file` (`READING_MODULE`, `READING_MODULE_COMPRESSED`) | path, dev, inode |
+| Module load from a file, including compressed modules | `lsm.s/kernel_read_file` (`READING_MODULE`, and `READING_MODULE_COMPRESSED` from 6.19; earlier kernels read compressed modules as `READING_MODULE`) | path, dev, inode |
 | Module load from memory | `lsm/kernel_load_data` | operation only |
 | kexec | the same two hooks with the kexec ids | path, or memory |
 | BPF program load | `lsm/bpf_prog_load`, user loads only | name, program and attach type, instruction count, attach BTF id |
@@ -646,7 +671,7 @@ emitting `getppid`).
 | 2026-11-02 | Sensitive files gated by fsnotify marks | 0 ns per unrelated open vs +12 ns for any `file_open` hook; catches io_uring |
 | 2026-11-02 | NAT from the kernel's conntrack, not ctnetlink | +46 ns/conn for an `nf_nat_setup_info` hook vs +1.53 µs/conn for ctnetlink |
 | 2026-11-02 | NAT at `__nf_conntrack_confirm`, emitting only for connections with NAT status | `nf_nat_setup_info` runs twice per new connection on a docker or k3s host, loopback included (338,612 calls for 169,306 connections, 5 translated); confirm runs once, 8.4–9.3 ns |
-| 2026-11-02 | Kernel ≥ 6.15 only | Needed for preempt kfuncs and acquire/release; no fallback paths |
+| 2026-11-02 | Kernel ≥ 6.18 only (corrected 2026-11-04 from ≥ 6.15) | Needed for preempt kfuncs (6.10), acquire/release (6.15) and `sched_process_exit`'s `group_dead` (6.16); verified on 6.18 (Amazon Linux 2023) and 7.0; no fallback paths |
 | 2026-11-02 | libbpf (C programs) with libbpf-rs userspace | Most mature CO-RE; skeleton generates Rust record types |
 | 2026-11-02 | Exec record carries the previous image key | Attributes execs by fork-only children without fork records |
 | 2026-11-02 | Keep fork-time task storage | 246 ns per fork (604 ns with 16 forkers), about 0.2% of a fork+exec; deriving the spawner at exec from `real_parent` loses it on reparenting, the double-fork case |
@@ -677,6 +702,7 @@ emitting `getppid`).
 | 2026-11-04 | One batch a minute, sent even when empty | One S3 PUT per batch: about 43,000 a month per host against 2.6 M at one a second; the steady object stream shows the agent alive |
 | 2026-11-04 | Key objects by host, agent run and batch sequence, written with `If-None-Match: *` | Retries store a batch once and nothing replaces a stored batch: a second PUT with other content returned 200 and kept the first |
 | 2026-11-04 | No disk spool in the agent | 64 MiB of gzip in memory holds about 1 GB of JSON; a spool would add crash recovery and files an attacker on the host can edit |
+| 2026-11-04 | Load overlayfs at startup when it is a module and not loaded yet | The drift flag reads `ovl_inode` through CO-RE, resolved only at load; an agent started before docker reported `exe_upper` false for a binary written into the container's upper layer, true with the autoload. Any user can trigger the same autoload |
 
 ## Open questions
 

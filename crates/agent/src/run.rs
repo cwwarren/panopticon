@@ -201,6 +201,7 @@ pub fn run(out_path: &str, poll: Duration) {
         .set_max_entries(u32::try_from(nclasses * ncpus).unwrap())
         .unwrap();
     open.progs.file_flush.set_autoattach(false);
+    load_overlay();
     let mut skel = open.load().unwrap();
     skel.attach().unwrap();
     let flush = skel
@@ -649,6 +650,26 @@ impl Watcher {
             );
             return;
         }
+    }
+}
+
+/// `exe_flags` reads `struct ovl_inode` through CO-RE, which resolves only against BTF present when the
+/// object loads. Where overlayfs is a module, container runtimes usually load it after the agent
+/// starts, so have the kernel load it now (the same autoload any overlay mount triggers).
+fn load_overlay() {
+    let filesystems = fs::read_to_string("/proc/filesystems").unwrap();
+    if filesystems
+        .lines()
+        .any(|l| l.split_whitespace().last() == Some("overlay"))
+    {
+        return;
+    }
+    let fd = unsafe { libc::syscall(libc::SYS_fsopen, c"overlay".as_ptr(), libc::FSOPEN_CLOEXEC) };
+    if fd < 0 {
+        eprintln!("overlay: {}", io::Error::last_os_error());
+    } else {
+        drop(unsafe { File::from_raw_fd(RawFd::try_from(fd).unwrap()) });
+        eprintln!("overlay: loaded module");
     }
 }
 

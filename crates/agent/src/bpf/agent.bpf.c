@@ -252,6 +252,11 @@ struct ovl_inode___pano {
 	struct dentry *__upperdentry;
 } __attribute__((preserve_access_index));
 
+/* The compressed-module ids are new in 6.19; older kernels read compressed modules as READING_MODULE
+ * and lack both enumerators, so they are resolved by name at load time. */
+enum kernel_read_file_id___pano { READING_MODULE_COMPRESSED___pano };
+enum kernel_load_data_id___pano { LOADING_MODULE_COMPRESSED___pano };
+
 struct ring_proc_value {
 	__u8 data[PROC_RING + PROC_SLACK];
 };
@@ -1315,7 +1320,9 @@ int BPF_PROG(on_kernel_read_file, struct file *file, enum kernel_read_file_id id
 	__u32 op, len = 0;
 	long n;
 
-	if (id == READING_MODULE || id == READING_MODULE_COMPRESSED)
+	if (id == READING_MODULE ||
+	    (bpf_core_enum_value_exists(enum kernel_read_file_id___pano, READING_MODULE_COMPRESSED___pano) &&
+	     id == bpf_core_enum_value(enum kernel_read_file_id___pano, READING_MODULE_COMPRESSED___pano)))
 		op = ADMIN_MODULE_FILE;
 	else if (id == READING_KEXEC_IMAGE || id == READING_KEXEC_INITRAMFS)
 		op = ADMIN_KEXEC_FILE;
@@ -1338,7 +1345,9 @@ int BPF_PROG(on_kernel_read_file, struct file *file, enum kernel_read_file_id id
 SEC("lsm/kernel_load_data")
 int BPF_PROG(on_kernel_load_data, enum kernel_load_data_id id, bool contents)
 {
-	if (id == LOADING_MODULE || id == LOADING_MODULE_COMPRESSED)
+	if (id == LOADING_MODULE ||
+	    (bpf_core_enum_value_exists(enum kernel_load_data_id___pano, LOADING_MODULE_COMPRESSED___pano) &&
+	     id == bpf_core_enum_value(enum kernel_load_data_id___pano, LOADING_MODULE_COMPRESSED___pano)))
 		admin_emit(ADMIN_MODULE_DATA, 0, 0, 0, 0);
 	else if (id == LOADING_KEXEC_IMAGE || id == LOADING_KEXEC_INITRAMFS)
 		admin_emit(ADMIN_KEXEC_DATA, 0, 0, 0, 0);
