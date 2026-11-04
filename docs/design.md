@@ -317,14 +317,18 @@ add a second code path.
 Ring sizes are compile-time per class. A ring must hold its class's fastest one-CPU producer for a
 poll interval plus however long the consumer is late (scheduling, a cgroup CPU quota). Net is 1 MiB
 per CPU, proc 256 KiB, file, admin and nat 64 KiB: 46 MiB on 32 CPUs, all of it in the agent's RSS
-because a mapped BPF array is resident whole. The fastest net producer measured is a one-thread
-loopback connect loop: on the Amazon Linux 2023 VM, 129 k connects/s write two 112-byte records each,
-29 MB/s on one CPU. 256 KiB lasts 9 ms at that rate and dropped 12% at the 10 ms poll (9% with 2
-threads, 8% with 4, 3% with 8); 1 MiB lasts 36 ms and dropped nothing at 1–8 threads, nothing at a 30
-ms poll with one thread and 0.01% with eight (every vCPU busy), and 26% at 50 ms. On this host (77 k
-connects/s per thread) 1 MiB dropped nothing at 1 or 32 threads at 10 and 30 ms polls, nor at 50 ms
-with one thread; 256 KiB dropped 45% at 30 ms. An exec flood writes about 1 MB/s per CPU and never
-filled 256 KiB of proc ring.
+because a mapped BPF array is resident whole. Net records are per connection, so their rate is bound
+by the CPU cost of a connect or accept, not by the link: a SYN is 84 bytes on the wire, 148 M/s at
+100 Gb/s. The fastest net producers measured, on the Amazon Linux 2023 VM, are a one-thread loopback
+connect loop (129 k connects/s, a connect and an accept record of 112 bytes each, 29 MB/s on one CPU)
+and a one-thread connect scan of an off-host address (non-blocking connects to a dummy interface,
+237 k connects/s, one record each, 27 MB/s). 256 KiB lasts about 9 ms at those rates and dropped at
+the 10 ms poll: the loopback loop 12% (9% with 2 threads, 8% with 4, 3% with 8), the scan 4.8% (2.3%
+with 8). 1 MiB lasts 36 ms and dropped nothing in either, at 1–8 threads; the loopback loop also held
+a 30 ms poll (0 with one thread, 0.01% with eight, every vCPU busy) and dropped 26% at 50 ms. On this
+host (77 k connects/s per thread) 1 MiB dropped nothing at 1 or 32 threads at 10 and 30 ms polls, nor
+at 50 ms with one thread; 256 KiB dropped 45% at 30 ms. An exec flood writes about 1 MB/s per CPU
+and never filled 256 KiB of proc ring.
 
 ### Userspace
 
