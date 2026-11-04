@@ -37,7 +37,9 @@ enum rec_type {
 };
 
 #define PROC_RING (256 << 10)
-#define NET_RING (256 << 10)
+// Net's fastest one-CPU producer (a loopback connect loop, 29 MB/s on the AL2023 VM) fills 256 KiB
+// in 9 ms; 1 MiB holds 36 ms, so a late poll does not drop.
+#define NET_RING (1 << 20)
 #define FILE_RING (64 << 10)
 #define ADMIN_RING (64 << 10)
 #define NAT_RING (64 << 10)

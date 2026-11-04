@@ -314,8 +314,17 @@ is 15. The kernel runs at `HZ=100`, so record times have 10 ms resolution, and b
 All classes use the same mechanism. Sharing one ring between low-rate classes would save a few MB and
 add a second code path.
 
-Ring sizes are compile-time per class and sized from expected rate × poll interval × headroom. The
-prototype uses 256 KiB per CPU for proc and net and 64 KiB for file, admin and nat (22 MiB on 32 CPUs).
+Ring sizes are compile-time per class. A ring must hold its class's fastest one-CPU producer for a
+poll interval plus however long the consumer is late (scheduling, a cgroup CPU quota). Net is 1 MiB
+per CPU, proc 256 KiB, file, admin and nat 64 KiB: 46 MiB on 32 CPUs, all of it in the agent's RSS
+because a mapped BPF array is resident whole. The fastest net producer measured is a one-thread
+loopback connect loop: on the Amazon Linux 2023 VM, 129 k connects/s write two 112-byte records each,
+29 MB/s on one CPU. 256 KiB lasts 9 ms at that rate and dropped 12% at the 10 ms poll (9% with 2
+threads, 8% with 4, 3% with 8); 1 MiB lasts 36 ms and dropped nothing at 1–8 threads, nothing at a 30
+ms poll with one thread and 0.01% with eight (every vCPU busy), and 26% at 50 ms. On this host (77 k
+connects/s per thread) 1 MiB dropped nothing at 1 or 32 threads at 10 and 30 ms polls, nor at 50 ms
+with one thread; 256 KiB dropped 45% at 30 ms. An exec flood writes about 1 MB/s per CPU and never
+filled 256 KiB of proc ring.
 
 ### Userspace
 
@@ -394,7 +403,7 @@ Measured on this host with Versity S3 Gateway (posix backend on tmpfs) as S3:
 | No client certificate; one from another CA | TLS alert `certificate_required`; `unknown_ca` |
 | Certificate without a DNS name | 403 |
 | Wrong S3 secret | S3 403, collector 503 |
-| Agent at 165 k records/s | 0.11 cores and 46 MB RSS, against 0.005 and 38 MB writing a file |
+| Agent at 165 k records/s | 0.11 cores and 46 MB RSS, against 0.005 and 38 MB writing a file (256 KiB net rings; 1 MiB adds 24 MB on 32 CPUs) |
 | Collector, 16 clients | 0.34 ms CPU per 256 KiB batch, 5.9 ms per 8 MiB batch, 26 MB RSS; 935 batches/s at 0.32 cores, the S3 gateway and the clients setting the rate |
 
 Instance-role credentials were fetched from a stand-in IMDSv2, but this S3 gateway rejects every
@@ -703,6 +712,7 @@ emitting `getppid`).
 | 2026-11-04 | Key objects by host, agent run and batch sequence, written with `If-None-Match: *` | Retries store a batch once and nothing replaces a stored batch: a second PUT with other content returned 200 and kept the first |
 | 2026-11-04 | No disk spool in the agent | 64 MiB of gzip in memory holds about 1 GB of JSON; a spool would add crash recovery and files an attacker on the host can edit |
 | 2026-11-04 | Load overlayfs at startup when it is a module and not loaded yet | The drift flag reads `ovl_inode` through CO-RE, resolved only at load; an agent started before docker reported `exe_upper` false for a binary written into the container's upper layer, true with the autoload. Any user can trigger the same autoload |
+| 2026-11-04 | Net ring 1 MiB per CPU instead of 256 KiB | A one-thread loopback connect loop on the AL2023 VM dropped 12% of net records at the 10 ms poll with 256 KiB and none with 1 MiB at 1–8 threads; 1 MiB also held a 30 ms poll (0–0.01%). Costs 24 MB more on 32 CPUs, all resident |
 
 ## Open questions
 
@@ -756,7 +766,8 @@ during that window measured +409 ns instead of +164 ns. With the backlog throttl
 core (`9b30ff8`), the same loop pinned to one CPU measured +188, +209 and +370 ns in the agent's first
 10 s (median +209 ns; the third run's baseline was also low).
 
-Memory: 31–34 MB RSS, against Falco's 348 MB.
+Memory: 31–34 MB RSS, against Falco's 348 MB. Net rings grew from 256 KiB to 1 MiB per CPU on
+2026-11-04, which adds 24 MB on this host's 32 CPUs (33.5 to 58 MB RSS under a connect flood).
 
 ### Per-program cost
 
